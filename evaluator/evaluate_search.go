@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/PaesslerAG/jsonpath"
-	"github.com/bradleyjkemp/sigma-go"
-	"github.com/bradleyjkemp/sigma-go/evaluator/modifiers"
+	"github.com/doracpphp/sigma-go"
+	"github.com/doracpphp/sigma-go/evaluator/modifiers"
 	"path"
 	"reflect"
 	"regexp"
@@ -85,7 +85,9 @@ func (rule RuleEvaluator) evaluateSearchExpression(search sigma.SearchExpr, sear
 
 func (rule RuleEvaluator) evaluateSearch(ctx context.Context, search sigma.Search, event Event, comparators map[string]modifiers.Comparator) (bool, error) {
 	if len(search.Keywords) > 0 {
-		return false, fmt.Errorf("keywords unsupported")
+		// Keywords are a valueless list of strings matched against the whole event
+		// (full-text search). The list is OR-ed by default.
+		return rule.matchKeywords(search.Keywords, event), nil
 	}
 
 	if len(search.EventMatchers) == 0 {
@@ -108,24 +110,74 @@ eventMatcher:
 				fieldModifiers = fieldModifiers[:len(fieldModifiers)-1]
 			}
 
-			// field matchers can specify modifiers (FieldName|modifier1|modifier2) which change the matching behaviour
-			var comparator modifiers.ComparatorFunc
-			var err error
-			comparator, err = modifiers.GetComparator(fieldMatcher.Field, comparators, fieldModifiers...)
-			if err != nil {
-				return false, err
+			// `exists`, `fieldref` and `neq` are handled here rather than inside the
+			// comparator: `exists`/`fieldref` need access to the event itself, and `neq`
+			// negates the whole field match. Strip them out of the modifier list first.
+			useExists := false
+			useFieldRef := false
+			negate := false
+			var passModifiers []string
+			for _, m := range fieldModifiers {
+				switch m {
+				case "exists":
+					useExists = true
+				case "fieldref":
+					useFieldRef = true
+				case "neq":
+					// `neq` is pySigma's SigmaNegateModifier: it negates the match of this
+					// detection item (NOT match). It applies on top of whatever comparator
+					// and value-linking (any/all) the rest of the modifiers select.
+					negate = true
+				case "expand":
+					// `expand` marks the value as a `%placeholder%` to be expanded;
+					// getMatcherValues already expands whole-value placeholders, so the
+					// modifier itself is a no-op here.
+				default:
+					passModifiers = append(passModifiers, m)
+				}
 			}
+			fieldModifiers = passModifiers
 
 			matcherValues, err := rule.getMatcherValues(ctx, fieldMatcher)
 			if err != nil {
 				return false, err
 			}
+
+			// `exists` checks field presence against a boolean and ignores any comparator.
+			if useExists {
+				matched := rule.matcherMatchesExists(fieldMatcher.Field, matcherValues, allValuesMustMatch, event)
+				// The field passes unless the (possibly negated) result is false.
+				if matched == negate {
+					continue eventMatcher
+				}
+				continue
+			}
+
+			// field matchers can specify modifiers (FieldName|modifier1|modifier2) which change the matching behaviour
+			var comparator modifiers.ComparatorFunc
+			comparator, err = modifiers.GetComparator(fieldMatcher.Field, comparators, fieldModifiers...)
+			if err != nil {
+				return false, err
+			}
+
+			// `fieldref` resolves each "value" as the name of another field and compares
+			// against that field's value in the event instead of a literal.
+			if useFieldRef {
+				matcherValues, err = rule.resolveFieldRefValues(matcherValues, event)
+				if err != nil {
+					return false, err
+				}
+			}
+
 			values, err := rule.GetFieldValuesFromEvent(fieldMatcher.Field, event)
 			if err != nil {
 				return false, err
 			}
-			if !rule.matcherMatchesValues(matcherValues, comparator, allValuesMustMatch, values) {
-				// this field didn't match so the overall matcher doesn't match, try the next EventMatcher
+			matched := rule.matcherMatchesValues(matcherValues, comparator, allValuesMustMatch, values)
+			// `neq` negates the field match (pySigma's SigmaNegateModifier). The field
+			// passes when matched != negate; otherwise the overall matcher fails and we
+			// try the next EventMatcher.
+			if matched == negate {
 				continue eventMatcher
 			}
 		}
@@ -138,12 +190,99 @@ eventMatcher:
 	return false, nil
 }
 
+// matchKeywords implements Sigma keyword (full-text) search: a list of strings
+// matched against every field value in the event. The keywords are OR-ed, and a
+// single keyword matches if it is found (case-insensitively by default, with `*`
+// and `?` wildcards) within any field value.
+func (rule RuleEvaluator) matchKeywords(keywords []string, event Event) bool {
+	values := allEventValues(event)
+	for _, keyword := range keywords {
+		for _, value := range values {
+			if keywordMatches(keyword, value, rule.caseSensitive) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// allEventValues returns the string form of every top-level field value in the event.
+func allEventValues(event Event) []string {
+	switch evt := event.(type) {
+	case map[string]string:
+		out := make([]string, 0, len(evt))
+		for _, v := range evt {
+			out = append(out, v)
+		}
+		return out
+	case map[string]interface{}:
+		out := make([]string, 0, len(evt))
+		for _, v := range evt {
+			out = append(out, modifiers.CoerceString(v))
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func keywordMatches(keyword, value string, caseSensitive bool) bool {
+	if strings.ContainsAny(keyword, "*?") {
+		re, err := keywordRegexp(keyword, caseSensitive)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(value)
+	}
+	if caseSensitive {
+		return strings.Contains(value, keyword)
+	}
+	return strings.Contains(strings.ToLower(value), strings.ToLower(keyword))
+}
+
+// keywordRegexp converts a keyword containing `*`/`?` wildcards into an unanchored
+// regexp (keyword search has "contains" semantics).
+func keywordRegexp(keyword string, caseSensitive bool) (*regexp.Regexp, error) {
+	var b strings.Builder
+	if !caseSensitive {
+		b.WriteString("(?i)")
+	}
+	for _, r := range keyword {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	return regexp.Compile(b.String())
+}
+
+// placeholderToken matches a single `%name%` placeholder. Names are restricted to
+// identifier-like characters so that stray `%` (e.g. URL-encoded `%20`) doesn't
+// accidentally look like a placeholder.
+var placeholderToken = regexp.MustCompile(`%[A-Za-z0-9_.-]+%`)
+
 func (rule *RuleEvaluator) getMatcherValues(ctx context.Context, matcher sigma.FieldMatcher) ([]string, error) {
+	hasExpand := false
+	for _, m := range matcher.Modifiers {
+		if m == "expand" {
+			hasExpand = true
+			break
+		}
+	}
+
 	matcherValues := []string{}
 	for _, abstractValue := range matcher.Values {
 		value := ""
 
 		switch abstractValue := abstractValue.(type) {
+		case nil:
+			// `Field: null` matches absent fields. The comparators represent this
+			// with the "null" sentinel (see baseComparator).
+			value = "null"
 		case string:
 			value = abstractValue
 		case int, float32, float64, bool:
@@ -152,8 +291,9 @@ func (rule *RuleEvaluator) getMatcherValues(ctx context.Context, matcher sigma.F
 			return nil, fmt.Errorf("expected scalar field matching value got: %v (%T)", abstractValue, abstractValue)
 		}
 
-		if strings.HasPrefix(value, "%") && strings.HasSuffix(value, "%") {
-			// expand placeholder to values
+		switch {
+		case strings.HasPrefix(value, "%") && strings.HasSuffix(value, "%"):
+			// The whole value is a placeholder; expand it to its values.
 			if rule.expandPlaceholder == nil {
 				return nil, fmt.Errorf("can't expand %s, no placeholder expander function defined", value)
 			}
@@ -162,11 +302,59 @@ func (rule *RuleEvaluator) getMatcherValues(ctx context.Context, matcher sigma.F
 				return nil, fmt.Errorf("failed to expand placeholder: %w", err)
 			}
 			matcherValues = append(matcherValues, placeholderValues...)
-		} else {
+		case hasExpand && placeholderToken.MatchString(value):
+			// A `%name%` placeholder embedded inside a larger value (e.g.
+			// `C:\Users\%user%\file`). Expand each placeholder and emit the cartesian
+			// product of the surrounding literal text with the expansion values.
+			expanded, err := rule.expandEmbeddedPlaceholders(ctx, value)
+			if err != nil {
+				return nil, err
+			}
+			matcherValues = append(matcherValues, expanded...)
+		default:
 			matcherValues = append(matcherValues, value)
 		}
 	}
 	return matcherValues, nil
+}
+
+// expandEmbeddedPlaceholders replaces every `%name%` placeholder in value with its
+// expansion values, returning the cartesian product of the resulting strings. A
+// placeholder that expands to no values yields no candidates (the value matches
+// nothing), mirroring the whole-value placeholder behaviour.
+func (rule *RuleEvaluator) expandEmbeddedPlaceholders(ctx context.Context, value string) ([]string, error) {
+	if rule.expandPlaceholder == nil {
+		return nil, fmt.Errorf("can't expand %s, no placeholder expander function defined", value)
+	}
+
+	results := []string{""}
+	last := 0
+	for _, loc := range placeholderToken.FindAllStringIndex(value, -1) {
+		literal := value[last:loc[0]]
+		token := value[loc[0]:loc[1]]
+		last = loc[1]
+
+		placeholderValues, err := rule.expandPlaceholder(ctx, token)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand placeholder: %w", err)
+		}
+
+		next := make([]string, 0, len(results)*len(placeholderValues))
+		for _, prefix := range results {
+			for _, pv := range placeholderValues {
+				next = append(next, prefix+literal+pv)
+			}
+		}
+		results = next
+	}
+
+	// Append any trailing literal after the final placeholder.
+	if tail := value[last:]; tail != "" {
+		for i := range results {
+			results[i] += tail
+		}
+	}
+	return results, nil
 }
 
 func (rule *RuleEvaluator) GetFieldValuesFromEvent(field string, event Event) ([]interface{}, error) {
@@ -221,6 +409,78 @@ func (rule *RuleEvaluator) matcherMatchesValues(matcherValues []string, comparat
 		}
 	}
 	return matched
+}
+
+// matcherMatchesExists implements the `exists` modifier: it compares whether the
+// field is present in the event against the boolean rule value(s) ("true"/"false").
+func (rule *RuleEvaluator) matcherMatchesExists(field string, matcherValues []string, allValuesMustMatch bool, event Event) bool {
+	present := rule.fieldExistsInEvent(field, event)
+	matched := allValuesMustMatch
+	for _, expectedValue := range matcherValues {
+		want := strings.EqualFold(expectedValue, "true")
+		valueMatched := present == want
+		if allValuesMustMatch {
+			matched = matched && valueMatched
+		} else {
+			matched = matched || valueMatched
+		}
+	}
+	return matched
+}
+
+// resolveFieldRefValues implements the `fieldref` modifier: each matcher value is
+// the name of another field, which is resolved to that field's value(s) in the
+// event. Missing referenced fields contribute no values (so they don't match).
+func (rule *RuleEvaluator) resolveFieldRefValues(fieldNames []string, event Event) ([]string, error) {
+	var resolved []string
+	for _, name := range fieldNames {
+		values, err := rule.GetFieldValuesFromEvent(name, event)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range values {
+			if v == nil {
+				continue
+			}
+			resolved = append(resolved, modifiers.CoerceString(v))
+		}
+	}
+	return resolved, nil
+}
+
+// fieldExistsInEvent reports whether the (possibly field-mapped) rule field is
+// present in the event.
+func (rule *RuleEvaluator) fieldExistsInEvent(field string, event Event) bool {
+	mappings := rule.fieldmappings[field]
+	if len(mappings) == 0 {
+		return eventKeyExists(event, field)
+	}
+	for _, mapping := range mappings {
+		switch {
+		case strings.HasPrefix(mapping, "$.") || strings.HasPrefix(mapping, "$["):
+			if v, err := evaluateJSONPath(mapping, event); err == nil && v != nil {
+				return true
+			}
+		default:
+			if eventKeyExists(event, mapping) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func eventKeyExists(e Event, key string) bool {
+	switch evt := e.(type) {
+	case map[string]string:
+		_, ok := evt[key]
+		return ok
+	case map[string]interface{}:
+		_, ok := evt[key]
+		return ok
+	default:
+		return false
+	}
 }
 
 // This is a hack because none of the JSONPath libraries expose the parsed AST :(

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bradleyjkemp/cupaloy/v2"
 	"github.com/google/go-cmp/cmp"
@@ -88,5 +89,38 @@ func TestMarshalRule(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestParseRule_TimeframeDays(t *testing.T) {
+	rule, err := ParseRule([]byte(`
+title: legacy day-unit timeframe
+detection:
+  selection:
+    EventID: 4625
+  timeframe: 30d
+  condition: selection | count() > 5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 30 * 24 * time.Hour; rule.Detection.Timeframe != want {
+		t.Fatalf("timeframe = %v, want %v", rule.Detection.Timeframe, want)
+	}
+
+	// Go duration syntax keeps working
+	rule, err = ParseRule([]byte(`
+title: go-syntax timeframe
+detection:
+  selection:
+    EventID: 4625
+  timeframe: 1h30m
+  condition: selection | count() > 5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 90 * time.Minute; rule.Detection.Timeframe != want {
+		t.Fatalf("timeframe = %v, want %v", rule.Detection.Timeframe, want)
 	}
 }

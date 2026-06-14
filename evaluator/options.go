@@ -2,9 +2,9 @@ package evaluator
 
 import (
 	"context"
-	"github.com/bradleyjkemp/sigma-go/evaluator/modifiers"
+	"github.com/doracpphp/sigma-go/evaluator/modifiers"
 
-	"github.com/bradleyjkemp/sigma-go"
+	"github.com/doracpphp/sigma-go"
 )
 
 type Option func(*RuleEvaluator)
@@ -12,6 +12,16 @@ type Option func(*RuleEvaluator)
 func CountImplementation(count func(ctx context.Context, key GroupedByValues) (float64, error)) Option {
 	return func(e *RuleEvaluator) {
 		e.count = count
+	}
+}
+
+// CountDistinctImplementation provides the implementation for the count-distinct
+// aggregation (e.g. `count(TargetUserName) by IpAddress`). For each event it is
+// passed the group key and the value of the counted field, and must return the
+// number of distinct values seen for that group within the rule's timeframe.
+func CountDistinctImplementation(countDistinct func(ctx context.Context, key GroupedByValues, value interface{}) (float64, error)) Option {
+	return func(e *RuleEvaluator) {
+		e.countDistinct = countDistinct
 	}
 }
 
@@ -24,6 +34,26 @@ func SumImplementation(sum func(ctx context.Context, key GroupedByValues, value 
 func AverageImplementation(average func(ctx context.Context, key GroupedByValues, value float64) (float64, error)) Option {
 	return func(e *RuleEvaluator) {
 		e.average = average
+	}
+}
+
+// MinImplementation provides the implementation for the min aggregation
+// (e.g. `min(FileSize) by Host`). For each event it is passed the group key
+// and the value of the aggregated field, and must return the minimum value
+// seen for that group within the rule's timeframe.
+func MinImplementation(min func(ctx context.Context, key GroupedByValues, value float64) (float64, error)) Option {
+	return func(e *RuleEvaluator) {
+		e.min = min
+	}
+}
+
+// MaxImplementation provides the implementation for the max aggregation
+// (e.g. `max(FileSize) by Host`). For each event it is passed the group key
+// and the value of the aggregated field, and must return the maximum value
+// seen for that group within the rule's timeframe.
+func MaxImplementation(max func(ctx context.Context, key GroupedByValues, value float64) (float64, error)) Option {
+	return func(e *RuleEvaluator) {
+		e.max = max
 	}
 }
 

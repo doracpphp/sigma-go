@@ -3,17 +3,20 @@ package sigma
 import (
 	"github.com/alecthomas/participle"
 	"github.com/alecthomas/participle/lexer"
-	"github.com/bradleyjkemp/sigma-go/internal/grammar"
+	"github.com/doracpphp/sigma-go/internal/grammar"
 )
 
 var (
 	searchExprLexer = lexer.Must(lexer.Regexp(`(?P<Keyword>(?i)(1 of them)|(all of them)|(1 of)|(all of))` +
-		`|(?P<SearchIdentifierPattern>\*?[a-zA-Z_]+\*[a-zA-Z0-9_*]*)` +
+		// A glob over search identifiers: identifier characters plus at least one `*`/`?`
+		// wildcard anywhere (e.g. selection_1_*, *_filter, selection?)
+		`|(?P<SearchIdentifierPattern>[a-zA-Z0-9_*?]*[*?][a-zA-Z0-9_*?]*)` +
 		`|(?P<SearchIdentifier>[a-zA-Z_][a-zA-Z0-9_]*)` +
 		`|(?P<Operator>(?i)and|or|not|[()])` + // TODO: this never actually matches anything because they get matched as a SearchIdentifier instead. However this isn't currently a problem because we don't parse anything in the Grammar as an Operator (we just use string constants which don't care about Operator vs SearchIdentifier)
 		`|(?P<ComparisonOperation>=|!=|<=|>=|<|>)` +
 		`|(?P<ComparisonValue>0|[1-9][0-9]*)` +
 		`|(?P<Pipe>[|])` +
+		`|(?P<Comma>,)` +
 		`|(\s+)`,
 	))
 

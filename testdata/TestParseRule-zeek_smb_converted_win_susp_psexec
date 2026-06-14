@@ -157,6 +157,7 @@
     Timeframe: (time.Duration) 0s
   },
   ID: (string) (len=36) "f1b3a22a-45e6-4004-afb5-4291f9c21166",
+  Name: (string) "",
   Related: ([]sigma.RelatedRule) (len=1) {
     (sigma.RelatedRule) {
       ID: (string) (len=36) "c462f537-a1e3-41a6-b5fc-b2c2cef9bf82",
@@ -174,6 +175,7 @@
     (string) (len=23) "attack.lateral_movement",
     (string) (len=16) "attack.t1021.002"
   },
+  Correlation: (*sigma.Correlation)(<nil>),
   AdditionalFields: (map[string]interface {}) (len=3) {
     (string) (len=4) "date": (string) (len=10) "2020/04/02",
     (string) (len=14) "falsepositives": ([]interface {}) (len=1) {

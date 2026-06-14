@@ -10,14 +10,25 @@ type Config struct {
 	Backends      []string // Lists the Sigma implementations that this config file is compatible with
 	FieldMappings map[string]FieldMapping
 	Logsources    map[string]LogsourceMapping
-	// TODO: LogsourceMerging option
-	DefaultIndex string                   // Defines a default index if no logsources match
-	Placeholders map[string][]interface{} // Defines values for placeholders that might appear in Sigma rules
+	// LogsourceMerging controls how the conditions contributed by matching logsource
+	// mappings are combined: "and" (default) requires all to match, "or" requires any.
+	LogsourceMerging LogsourceMerging         `yaml:"logsourcemerging,omitempty"`
+	DefaultIndex     string                   // Defines a default index if no logsources match
+	Placeholders     map[string][]interface{} // Defines values for placeholders that might appear in Sigma rules
 }
+
+// LogsourceMerging selects how logsource-mapping conditions are combined.
+type LogsourceMerging string
+
+const (
+	LogsourceMergeAnd LogsourceMerging = "and"
+	LogsourceMergeOr  LogsourceMerging = "or"
+)
 
 type FieldMapping struct {
 	TargetNames []string // The name(s) that appear in the events being matched
-	// TODO: support conditional mappings?
+	// Note: conditional field mappings are a pySigma processing-pipeline concept and
+	// are not part of the legacy Sigma config format implemented here.
 }
 
 func (f *FieldMapping) UnmarshalYAML(value *yaml.Node) error {

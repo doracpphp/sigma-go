@@ -851,6 +851,7 @@
       }
     }
   },
+  LogsourceMerging: (sigma.LogsourceMerging) "",
   DefaultIndex: (string) "",
   Placeholders: (map[string][]interface {}) <nil>
 }

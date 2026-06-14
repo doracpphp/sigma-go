@@ -6,7 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/bradleyjkemp/sigma-go/internal/grammar"
+	"github.com/doracpphp/sigma-go/internal/grammar"
 )
 
 type Condition struct {
@@ -187,75 +187,75 @@ type AggregationFunc interface {
 
 type Count struct {
 	Field     string
-	GroupedBy string
+	GroupedBy []string
 }
 
 func (Count) aggregationFunc() {}
 
 func (c Count) toString() string {
 	result := "count(" + c.Field + ")"
-	if c.GroupedBy != "" {
-		result += " by " + c.GroupedBy
+	if len(c.GroupedBy) > 0 {
+		result += " by " + strings.Join(c.GroupedBy, ", ")
 	}
 	return result
 }
 
 type Min struct {
 	Field     string
-	GroupedBy string
+	GroupedBy []string
 }
 
 func (Min) aggregationFunc() {}
 
 func (c Min) toString() string {
 	result := "min(" + c.Field + ")"
-	if c.GroupedBy != "" {
-		result += " by " + c.GroupedBy
+	if len(c.GroupedBy) > 0 {
+		result += " by " + strings.Join(c.GroupedBy, ", ")
 	}
 	return result
 }
 
 type Max struct {
 	Field     string
-	GroupedBy string
+	GroupedBy []string
 }
 
 func (Max) aggregationFunc() {}
 
 func (c Max) toString() string {
 	result := "max(" + c.Field + ")"
-	if c.GroupedBy != "" {
-		result += " by " + c.GroupedBy
+	if len(c.GroupedBy) > 0 {
+		result += " by " + strings.Join(c.GroupedBy, ", ")
 	}
 	return result
 }
 
 type Average struct {
 	Field     string
-	GroupedBy string
+	GroupedBy []string
 }
 
 func (Average) aggregationFunc() {}
 
 func (c Average) toString() string {
 	result := "avg(" + c.Field + ")"
-	if c.GroupedBy != "" {
-		result += " by " + c.GroupedBy
+	if len(c.GroupedBy) > 0 {
+		result += " by " + strings.Join(c.GroupedBy, ", ")
 	}
 	return result
 }
 
 type Sum struct {
 	Field     string
-	GroupedBy string
+	GroupedBy []string
 }
 
 func (Sum) aggregationFunc() {}
 
 func (c Sum) toString() string {
 	result := "sum(" + c.Field + ")"
-	if c.GroupedBy != "" {
-		result += " by " + c.GroupedBy
+	if len(c.GroupedBy) > 0 {
+		result += " by " + strings.Join(c.GroupedBy, ", ")
 	}
 	return result
 }
@@ -351,6 +351,18 @@ func searchToAST(node interface{}) (SearchExpr, error) {
 func aggregationToAST(agg *grammar.Aggregation) (AggregationExpr, error) {
 	if agg == nil {
 		return nil, nil
+	}
+
+	if agg.Near != nil {
+		condition, err := searchToAST(*agg.Near)
+		if err != nil {
+			return nil, err
+		}
+		return Near{Condition: condition}, nil
+	}
+
+	if agg.Function == nil {
+		return nil, fmt.Errorf("aggregation has neither a near expression nor a function")
 	}
 
 	var function AggregationFunc

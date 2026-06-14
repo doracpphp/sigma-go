@@ -3,10 +3,11 @@ package evaluator
 import (
 	"context"
 	aho_corasick "github.com/BobuSumisu/aho-corasick"
-	"github.com/bradleyjkemp/sigma-go"
-	"github.com/bradleyjkemp/sigma-go/evaluator/modifiers"
+	"github.com/doracpphp/sigma-go"
+	"github.com/doracpphp/sigma-go/evaluator/modifiers"
 	"regexp"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -48,6 +49,11 @@ func ForRules(rules []sigma.Rule, options ...Option) RuleEvaluatorBundle {
 								continue
 							}
 							stringValue := modifiers.CoerceString(value)
+							// Wildcard values aren't literal substrings; they're matched
+							// via the fallback comparator, so they don't belong in the trie.
+							if modifiers.HasUnescapedWildcard(stringValue) {
+								continue
+							}
 							if !bundle.caseSensitive {
 								stringValue = strings.ToLower(stringValue)
 							}
@@ -130,8 +136,15 @@ func (bundle RuleEvaluatorBundle) Matches(ctx context.Context, event Event) ([]R
 		comparators[name] = comparator
 	}
 
-	// override the contains comparator to use our custom one
+	// override the contains comparator to use our custom one. The embedded
+	// Comparator is the standard contains comparator, used as a fallback for
+	// wildcard values that can't be looked up in the Aho-Corasick trie.
+	fallback := modifiers.Comparators["contains"]
+	if bundle.caseSensitive {
+		fallback = modifiers.ComparatorsCaseSensitive["contains"]
+	}
 	contains := &ahocorasickContains{
+		Comparator:    fallback,
 		matchers:      bundle.ahocorasick,
 		caseSensitive: bundle.caseSensitive,
 		results:       map[string]map[*byte]map[string]bool{},
@@ -171,36 +184,81 @@ func (a *ahocorasickContains) MatchesField(field string, actual any, expected an
 		return true, nil
 	}
 
-	results := a.getResults(field, modifiers.CoerceString(actual), a.caseSensitive)
-
 	needle := modifiers.CoerceString(expected)
+
+	// A `contains` value with wildcards (e.g. `foo*bar`) isn't a literal substring
+	// so it can't be looked up in the Aho-Corasick trie. Defer to the standard
+	// comparator, which matches it through the wildcard engine. These are rare, so
+	// the per-event regex cost is acceptable.
+	if modifiers.HasUnescapedWildcard(needle) {
+		return a.Comparator.Matches(actual, expected)
+	}
+
+	results := a.getResults(field, modifiers.CoerceString(actual), a.caseSensitive)
 	if !a.caseSensitive {
-		// when operating in case-insensitive mode, search strings must be canonicalised
-		// (this is ok because search strings are much smaller than the haystack)
-		// TODO: should we just modify the rules in this case? (saving the lower-casing every time)
-		needle = strings.ToLower(needle)
+		// when operating in case-insensitive mode, search strings must be canonicalised.
+		// Needles are rule values (bounded cardinality) but this runs once per value
+		// per event, so cache the lowercasing instead of re-allocating every time.
+		needle = lowerCached(needle)
 	}
 	return results[needle], nil
+}
+
+var loweredNeedles sync.Map // map[string]string
+
+func lowerCached(s string) string {
+	if cached, ok := loweredNeedles.Load(s); ok {
+		return cached.(string)
+	}
+	lowered := strings.ToLower(s)
+	loweredNeedles.Store(s, lowered)
+	return lowered
 }
 
 type ahocorasickRe struct {
 	*ahocorasickContains
 }
 
-func (a *ahocorasickRe) MatchesField(field string, actual any, expected any) (bool, error) {
-	stringRe := modifiers.CoerceString(expected)
-	re, err := regexp.Compile(stringRe) // todo: cache this?
-	if err != nil {
-		return false, err
-	}
+// regexInfo is the per-pattern analysis needed by ahocorasickRe: the compiled
+// regex plus the set of simple strings that necessarily appear if it matches.
+// It is cached because MatchesField runs once per event per regex value, and
+// both regexp.Compile and regexStrings are far more expensive than the match
+// itself. Patterns come from rules so the cardinality is bounded by the ruleset.
+type regexInfo struct {
+	re              *regexp.Regexp
+	necessary       []string
+	caseInsensitive bool
+}
 
+var regexInfos sync.Map // map[string]*regexInfo
+
+func getRegexInfo(pattern string) (*regexInfo, error) {
+	if cached, ok := regexInfos.Load(pattern); ok {
+		return cached.(*regexInfo), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
 	// this function returns a set of simple strings
 	// which necessarily appear if the regex matches
-	// If none are present in `actual`, we don't need to run the regex
-	ss, caseInsensitive, err := regexStrings(stringRe)
+	// If none are present in the haystack, we don't need to run the regex
+	ss, caseInsensitive, err := regexStrings(pattern)
+	if err != nil {
+		return nil, err
+	}
+	info := &regexInfo{re: re, necessary: ss, caseInsensitive: caseInsensitive}
+	regexInfos.Store(pattern, info)
+	return info, nil
+}
+
+func (a *ahocorasickRe) MatchesField(field string, actual any, expected any) (bool, error) {
+	stringRe := modifiers.CoerceString(expected)
+	info, err := getRegexInfo(stringRe)
 	if err != nil {
 		return false, err
 	}
+	re, ss, caseInsensitive := info.re, info.necessary, info.caseInsensitive
 
 	haystack := modifiers.CoerceString(actual)
 	results := a.getResults(field, haystack, !caseInsensitive)

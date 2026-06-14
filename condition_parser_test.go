@@ -18,6 +18,10 @@ func TestParseCondition(t *testing.T) {
 		{"a | count(b) > 0", Condition{Search: SearchIdentifier{"a"}, Aggregation: Comparison{Func: Count{Field: "b"}, Op: GreaterThan, Threshold: 0}}},
 		{"a | count(b) >= 0", Condition{Search: SearchIdentifier{"a"}, Aggregation: Comparison{Func: Count{Field: "b"}, Op: GreaterThanEqual, Threshold: 0}}},
 		{"note and pad", Condition{Search: And{SearchIdentifier{"note"}, SearchIdentifier{"pad"}}}},
+		// identifier patterns may contain digits before the wildcard and `?` wildcards
+		{"all of selection_1_* or 1 of selection_other_*", Condition{Search: Or{AllOfPattern{"selection_1_*"}, OneOfPattern{"selection_other_*"}}}},
+		{"1 of *_filter", Condition{Search: OneOfPattern{"*_filter"}}},
+		{"all of selection?", Condition{Search: AllOfPattern{"selection?"}}},
 	}
 
 	for _, tc := range tt {

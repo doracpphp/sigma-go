@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bradleyjkemp/sigma-go"
+	"github.com/doracpphp/sigma-go"
 )
 
 func TestRuleEvaluator_RelevantToEvent_LogsourceRewriting(t *testing.T) {

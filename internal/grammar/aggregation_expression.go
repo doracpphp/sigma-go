@@ -1,11 +1,12 @@
 package grammar
 
 type Aggregation struct {
-	Function         AggregationFunction `@@`
-	AggregationField string              `("(" (@SearchIdentifier)? ")")?`
-	GroupField       string              `("by" @SearchIdentifier)?`
-	Comparison       *ComparisonOp       `(@@`
-	Threshold        float64             `@ComparisonValue)?`
+	Near             *Disjunction         `(  "near" @@`
+	Function         *AggregationFunction `|  @@`
+	AggregationField string               `   ("(" (@SearchIdentifier)? ")")?`
+	GroupField       []string             `   ("by" @SearchIdentifier ("," @SearchIdentifier)*)?`
+	Comparison       *ComparisonOp        `   (@@`
+	Threshold        float64              `   @ComparisonValue)? )`
 }
 
 type AggregationFunction struct {

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bradleyjkemp/sigma-go"
+	"github.com/doracpphp/sigma-go"
 )
 
 const testRule = `
@@ -74,10 +74,12 @@ func FuzzRuleBundleMatches(f *testing.F) {
 
 		go func() {
 			defer func() {
-				wg.Done()
+				// recover()/err must be written before Done() releases Wait(),
+				// otherwise the waiting goroutine reads err while we write it.
 				if r := recover(); r != nil {
 					err = fmt.Errorf("panic in parsing")
 				}
+				wg.Done()
 			}()
 			r1, err = sigma.ParseRule([]byte(rule1))
 			if err != nil || len(r1.Detection.Searches) == 0 || len(r1.Detection.Conditions) == 0 {
@@ -160,11 +162,11 @@ func FuzzRuleLazyMatches(f *testing.F) {
 		lazyEvalResult, lazyEvalErr := lazyEval.Matches(context.Background(), e)
 
 		if (evalErr == nil) != (lazyEvalErr == nil) {
-			f.Fatal("err mismatch", evalErr, lazyEvalErr)
+			t.Fatal("err mismatch", evalErr, lazyEvalErr)
 		}
 
 		if evalResult.Match != lazyEvalResult.Match {
-			f.Fatal("result mismatch", evalErr, lazyEvalErr)
+			t.Fatal("result mismatch", evalErr, lazyEvalErr)
 		}
 	})
 }

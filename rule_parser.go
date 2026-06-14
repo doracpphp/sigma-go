@@ -15,6 +15,7 @@ type Rule struct {
 	Detection Detection
 
 	ID          string        `yaml:",omitempty" json:",omitempty"`
+	Name        string        `yaml:",omitempty" json:",omitempty"`
 	Related     []RelatedRule `yaml:",omitempty" json:",omitempty"`
 	Status      string        `yaml:",omitempty" json:",omitempty"`
 	Description string        `yaml:",omitempty" json:",omitempty"`
@@ -22,6 +23,10 @@ type Rule struct {
 	Level       string        `yaml:",omitempty" json:",omitempty"`
 	References  []string      `yaml:",omitempty" json:",omitempty"`
 	Tags        []string      `yaml:",omitempty" json:",omitempty"`
+
+	// Correlation is set for Sigma correlation rules (documents with a top-level
+	// `correlation:` key) and is nil for normal detection rules.
+	Correlation *Correlation `yaml:",omitempty" json:",omitempty"`
 
 	// Any non-standard fields will end up in here
 	AdditionalFields map[string]interface{} `yaml:",inline,omitempty" json:",inline,omitempty"`
@@ -63,9 +68,21 @@ func (d *Detection) UnmarshalYAML(node *yaml.Node) error {
 				return err
 			}
 		case "timeframe":
-			if err := value.Decode(&d.Timeframe); err != nil {
+			var raw string
+			if err := value.Decode(&raw); err != nil {
 				return err
 			}
+			// Sigma timeframes are a number with a single s/m/h/d unit; `d` isn't
+			// valid Go duration syntax. Fall back to Go syntax for backwards
+			// compatibility with values like "1h30m".
+			timeframe, err := ParseTimespan(raw)
+			if err != nil {
+				timeframe, err = time.ParseDuration(raw)
+				if err != nil {
+					return fmt.Errorf("invalid timeframe %q", raw)
+				}
+			}
+			d.Timeframe = timeframe
 		default:
 			search := Search{}
 			if err := search.UnmarshalYAML(value); err != nil {
@@ -144,7 +161,7 @@ func (s *Search) UnmarshalYAML(node *yaml.Node) error {
 		return node.Decode(&s.EventMatchers[0])
 
 	// Or, SearchIdentifiers can be a list.
-	// Either of keywords (not supported by this library) or a list of EventMatchers (maps of fields to values)
+	// Either a list of keywords (full-text search strings) or a list of EventMatchers (maps of fields to values)
 	case yaml.SequenceNode:
 		if len(node.Content) == 0 {
 			return fmt.Errorf("invalid search condition node (empty) (line %d)", node.Line)

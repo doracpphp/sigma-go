@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bradleyjkemp/sigma-go"
+	"github.com/doracpphp/sigma-go"
 )
 
 func TestRuleEvaluator_Matches(t *testing.T) {
@@ -409,5 +409,65 @@ func TestRuleEvaluator_MatchesGreaterThan(t *testing.T) {
 		t.Error("rule should have matched", result.SearchResults)
 	case !result.SearchResults["foo0.5"] || result.SearchResults["foo1"]:
 		t.Error("expected foo0.5 to be true but not foo1")
+	}
+}
+
+func TestRuleEvaluator_MatchesNullValue(t *testing.T) {
+	rule, err := sigma.ParseRule([]byte(`
+title: null matches absent field
+detection:
+  sel:
+    Field: null
+  condition: sel
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := ForRule(rule)
+
+	result, err := e.Matches(context.Background(), map[string]interface{}{"Other": "x"})
+	switch {
+	case err != nil:
+		t.Fatal(err)
+	case !result.Match:
+		t.Error("null should match an event where the field is absent")
+	}
+
+	result, err = e.Matches(context.Background(), map[string]interface{}{"Field": "x"})
+	switch {
+	case err != nil:
+		t.Fatal(err)
+	case result.Match:
+		t.Error("null should not match an event where the field has a value")
+	}
+}
+
+func TestRuleEvaluator_MatchesPlainWildcards(t *testing.T) {
+	rule, err := sigma.ParseRule([]byte(`
+title: plain values support wildcards
+detection:
+  sel:
+    TargetFilename: '*\lsass.dmp'
+  condition: sel
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := ForRule(rule)
+
+	result, err := e.Matches(context.Background(), map[string]interface{}{"TargetFilename": `C:\temp\lsass.dmp`})
+	switch {
+	case err != nil:
+		t.Fatal(err)
+	case !result.Match:
+		t.Error(`'*\lsass.dmp' should match 'C:\temp\lsass.dmp'`)
+	}
+
+	result, err = e.Matches(context.Background(), map[string]interface{}{"TargetFilename": `C:\temp\lsass.dmp.txt`})
+	switch {
+	case err != nil:
+		t.Fatal(err)
+	case result.Match:
+		t.Error("wildcard values are anchored and should not match a longer value")
 	}
 }
