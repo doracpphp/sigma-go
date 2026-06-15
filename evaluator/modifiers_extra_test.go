@@ -355,6 +355,69 @@ detection:
 	}
 }
 
+// An absent field must never match contains/startswith/endswith, even with a
+// wildcard value like `*`. Regression test for over-matching where a `ps_module`
+// rule's `ContextInfo|contains: '*'` fired on every event whose ContextInfo field
+// was absent (nil coerces to the non-empty string "<nil>").
+func TestContainsAbsentFieldNeverMatches(t *testing.T) {
+	ctx := context.Background()
+	rules := map[string]sigma.Rule{
+		"contains star": mustRule(t, `
+title: contains star
+detection:
+  selection:
+    ContextInfo|contains: '*'
+  condition: selection
+`),
+		"contains plain": mustRule(t, `
+title: contains plain
+detection:
+  selection:
+    ContextInfo|contains: 'powershell'
+  condition: selection
+`),
+		"startswith star": mustRule(t, `
+title: startswith star
+detection:
+  selection:
+    ContextInfo|startswith: '*'
+  condition: selection
+`),
+		"endswith star": mustRule(t, `
+title: endswith star
+detection:
+  selection:
+    ContextInfo|endswith: '*'
+  condition: selection
+`),
+	}
+
+	// Event without the ContextInfo field at all.
+	absent := map[string]interface{}{"Image": "C:\\Windows\\System32\\cmd.exe"}
+	// Event where ContextInfo is present (so `*` legitimately matches).
+	present := map[string]interface{}{"ContextInfo": "Host Application = powershell.exe"}
+
+	for name, rule := range rules {
+		// Absent field: must not match in either the single-rule or bundle path.
+		if res, err := ForRule(rule).Matches(ctx, absent); err != nil {
+			t.Fatal(err)
+		} else if res.Match {
+			t.Errorf("%s: absent ContextInfo should not match (single-rule)", name)
+		}
+		if results, err := ForRules([]sigma.Rule{rule}).Matches(ctx, absent); err != nil {
+			t.Fatal(err)
+		} else if len(results) == 1 && results[0].Match {
+			t.Errorf("%s: absent ContextInfo should not match (bundle)", name)
+		}
+	}
+
+	// A present ContextInfo still matches the wildcard rules (sanity check that the
+	// guard didn't over-correct).
+	if res, _ := ForRule(rules["contains star"]).Matches(ctx, present); !res.Match {
+		t.Error("present ContextInfo should still match contains '*'")
+	}
+}
+
 // `neq` is pySigma's SigmaNegateModifier: it negates the field match (NOT match),
 // works on any value type, and composes with comparators and any/all linking. It
 // must behave identically in the single-rule and bundle paths.

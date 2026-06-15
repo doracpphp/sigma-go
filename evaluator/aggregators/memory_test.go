@@ -11,6 +11,54 @@ import (
 	"github.com/doracpphp/sigma-go/internal/slidingstatistics"
 )
 
+// When the caller supplies the event timestamp via evaluator.WithEventTime, the
+// count window must track event time, not wall-clock arrival time. Four failures
+// spaced 10 minutes apart never put more than one event inside a 5m window, so a
+// `count() > 3` rule must NOT fire even though all four are fed "instantly".
+func TestCountUsesEventTime(t *testing.T) {
+	rule, err := sigma.ParseRule([]byte(`
+title: Brute force
+detection:
+  failed:
+    EventID: 4625
+  condition: failed | count() by TargetUserName > 3
+  timeframe: 5m
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := evaluator.ForRule(rule, InMemory(time.Hour)...)
+	event := map[string]interface{}{"EventID": 4625, "TargetUserName": "alice"}
+
+	base := time.Date(2021, 3, 15, 12, 0, 0, 0, time.UTC)
+	var lastMatch bool
+	for i := 0; i < 4; i++ {
+		ctx := evaluator.WithEventTime(context.Background(), base.Add(time.Duration(i)*10*time.Minute))
+		r, err := e.Matches(ctx, event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastMatch = r.Match
+	}
+	if lastMatch {
+		t.Fatal("events spaced beyond the 5m window must not accumulate to count() > 3")
+	}
+
+	// The same four events within the window (1 minute apart) DO fire.
+	e2 := evaluator.ForRule(rule, InMemory(time.Hour)...)
+	for i := 0; i < 4; i++ {
+		ctx := evaluator.WithEventTime(context.Background(), base.Add(time.Duration(i)*time.Minute))
+		r, err := e2.Matches(ctx, event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastMatch = r.Match
+	}
+	if !lastMatch {
+		t.Fatal("four events within the 5m window should fire count() > 3")
+	}
+}
+
 // Brute force: count() by TargetUserName > 3 within a 5m timeframe.
 // The rule's own timeframe must be honoured even though InMemory is
 // constructed with a different (longer) default window.

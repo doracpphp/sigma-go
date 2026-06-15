@@ -96,10 +96,20 @@ func (i *inMemory) window(groupBy evaluator.GroupedByValues) time.Duration {
 	return i.timeframe
 }
 
+// eventNow returns the timestamp of the event being evaluated (so aggregation
+// windows track event time, correct for offline replay), falling back to the
+// current wall-clock time when the caller didn't supply one.
+func eventNow(ctx context.Context) time.Time {
+	if t, ok := evaluator.EventTimeFromContext(ctx); ok {
+		return t
+	}
+	return time.Now()
+}
+
 func (i *inMemory) count(ctx context.Context, groupBy evaluator.GroupedByValues) (float64, error) {
 	i.Lock()
 	defer i.Unlock()
-	now := time.Now()
+	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
 	c := getTracked(i.counts, groupBy.Key(), window, now, func() *slidingstatistics.Counter {
@@ -114,7 +124,7 @@ func (i *inMemory) count(ctx context.Context, groupBy evaluator.GroupedByValues)
 func (i *inMemory) countDistinct(ctx context.Context, groupBy evaluator.GroupedByValues, value interface{}) (float64, error) {
 	i.Lock()
 	defer i.Unlock()
-	now := time.Now()
+	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
 	t := getTracked(i.distincts, groupBy.Key(), window, now, func() *distinctTracker {
@@ -127,7 +137,7 @@ func (i *inMemory) countDistinct(ctx context.Context, groupBy evaluator.GroupedB
 func (i *inMemory) average(ctx context.Context, groupBy evaluator.GroupedByValues, value float64) (float64, error) {
 	i.Lock()
 	defer i.Unlock()
-	now := time.Now()
+	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
 	a := getTracked(i.averages, groupBy.Key(), window, now, func() *slidingstatistics.Averager {
@@ -140,7 +150,7 @@ func (i *inMemory) average(ctx context.Context, groupBy evaluator.GroupedByValue
 func (i *inMemory) sum(ctx context.Context, groupBy evaluator.GroupedByValues, value float64) (float64, error) {
 	i.Lock()
 	defer i.Unlock()
-	now := time.Now()
+	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
 	a := getTracked(i.sums, groupBy.Key(), window, now, func() *slidingstatistics.Counter {
@@ -153,7 +163,7 @@ func (i *inMemory) sum(ctx context.Context, groupBy evaluator.GroupedByValues, v
 func (i *inMemory) min(ctx context.Context, groupBy evaluator.GroupedByValues, value float64) (float64, error) {
 	i.Lock()
 	defer i.Unlock()
-	now := time.Now()
+	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
 	t := getTracked(i.extremes, groupBy.Key(), window, now, func() *extremeTracker {
@@ -165,7 +175,7 @@ func (i *inMemory) min(ctx context.Context, groupBy evaluator.GroupedByValues, v
 func (i *inMemory) max(ctx context.Context, groupBy evaluator.GroupedByValues, value float64) (float64, error) {
 	i.Lock()
 	defer i.Unlock()
-	now := time.Now()
+	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
 	t := getTracked(i.extremes, groupBy.Key(), window, now, func() *extremeTracker {

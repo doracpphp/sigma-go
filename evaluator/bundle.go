@@ -178,6 +178,11 @@ type ahocorasickContains struct {
 }
 
 func (a *ahocorasickContains) MatchesField(field string, actual any, expected any) (bool, error) {
+	if actual == nil {
+		// An absent field has no value to contain anything, so it never matches
+		// (mirrors the standard contains comparator).
+		return false, nil
+	}
 	if expected == "" {
 		// compatability with old |contains behaviour
 		// possibly a bug?

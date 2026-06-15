@@ -41,6 +41,8 @@ func main() {
 	configPath := fs.String("config", "", "optional Sigma config file (field mappings)")
 	outPath := fs.String("out", "", "output CSV file (default: stdout)")
 	timeframe := fs.Duration("timeframe", time.Hour, "default sliding window for aggregation rules without their own timeframe")
+	channelFilter := fs.Bool("channel-filter", true, "only evaluate a rule against events from the channel its logsource targets (faster, fewer cross-channel matches)")
+	exclude := fs.String("exclude", "", "comma-separated files of rule IDs to skip, in `<uuid> # comment` format (e.g. Hayabusa's exclude_rules.txt,noisy_rules.txt)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: sigmac -rules <file|dir> [-config c.yml] [-out alerts.csv] <file.evtx> ...")
 		fmt.Fprintln(os.Stderr, "  <file.evtx> is one or more .evtx event log files")
@@ -66,17 +68,63 @@ func main() {
 		fs.Usage()
 		os.Exit(2)
 	}
+	channelFilterEnabled = *channelFilter
 
-	if err := run(*rulesPath, *configPath, *outPath, *timeframe, inputs); err != nil {
+	excludeIDs, err := loadExcludeIDs(*exclude)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+
+	if err := run(*rulesPath, *configPath, *outPath, *timeframe, inputs, excludeIDs); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(rulesPath, configPath, outPath string, timeframe time.Duration, inputs []string) error {
+// loadExcludeIDs reads rule IDs to skip from the given comma-separated list of
+// files. Each line is `<uuid>` optionally followed by `# comment`; blank lines and
+// lines starting with `#` are ignored. This accepts Hayabusa's exclude_rules.txt /
+// noisy_rules.txt verbatim.
+func loadExcludeIDs(spec string) (map[string]bool, error) {
+	ids := map[string]bool{}
+	for _, path := range strings.Split(spec, ",") {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("reading exclude file: %w", err)
+		}
+		for _, line := range strings.Split(string(contents), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			ids[strings.ToLower(strings.Fields(line)[0])] = true
+		}
+	}
+	return ids, nil
+}
+
+func run(rulesPath, configPath, outPath string, timeframe time.Duration, inputs []string, excludeIDs map[string]bool) error {
 	rules, err := loadRules(rulesPath)
 	if err != nil {
 		return err
+	}
+	if len(excludeIDs) > 0 {
+		kept := rules[:0]
+		excluded := 0
+		for _, r := range rules {
+			if r.ID != "" && excludeIDs[strings.ToLower(r.ID)] {
+				excluded++
+				continue
+			}
+			kept = append(kept, r)
+		}
+		rules = kept
+		fmt.Fprintf(os.Stderr, "excluded %d rule(s) by ID\n", excluded)
 	}
 	if len(rules) == 0 {
 		return fmt.Errorf("no valid Sigma rules found in %s", rulesPath)
@@ -190,7 +238,13 @@ func scanFile(ctx context.Context, path string, bundle evaluator.RuleEvaluatorBu
 			event := flattenEvent(record.Event)
 			scanned++
 
-			recordID := fmt.Sprint(record.Header.RecordID)
+			// Use the real EventRecordID from the event's System block; the parser's
+			// per-chunk Header.RecordID is only a chunk-local index, not the global
+			// record number, so fall back to it only when System is missing it.
+			recordID := field(event, "EventRecordID")
+			if recordID == "" {
+				recordID = fmt.Sprint(record.Header.RecordID)
+			}
 			rows, err := matchEvent(ctx, event, base, recordID, bundle, correlations)
 			if err != nil {
 				return scanned, matched, err
@@ -210,11 +264,17 @@ func scanFile(ctx context.Context, path string, bundle evaluator.RuleEvaluatorBu
 // one CSV row per match.
 func matchEvent(ctx context.Context, event map[string]interface{}, sourceFile, recordID string, bundle evaluator.RuleEvaluatorBundle, correlations []*evaluator.CorrelationEvaluator) ([][]string, error) {
 	var rows [][]string
+	// Window aggregation/correlation by the event's own timestamp (correct for
+	// historical replay) rather than wall-clock arrival time.
+	if t, ok := eventTimeValue(event); ok {
+		ctx = evaluator.WithEventTime(ctx, t)
+	}
 	eventJSON := toJSON(event)
+	eventChannel := field(event, "Channel")
 	common := func() []string {
 		return []string{
 			eventTimestamp(event), sourceFile, recordID,
-			field(event, "Computer"), field(event, "Channel"), field(event, "EventID"),
+			field(event, "Computer"), eventChannel, field(event, "EventID"),
 		}
 	}
 
@@ -224,6 +284,11 @@ func matchEvent(ctx context.Context, event map[string]interface{}, sourceFile, r
 	}
 	for _, res := range results {
 		if !res.Match {
+			continue
+		}
+		// Channel filter: skip a rule whose logsource targets a different channel
+		// than this event's (mirrors Hayabusa, and avoids cross-channel matches).
+		if !ruleAppliesToChannel(res.Rule.Logsource, eventChannel) {
 			continue
 		}
 		row := append(common(),
@@ -322,7 +387,7 @@ func mergeLeaves(d *ordereddict.Dict, out map[string]interface{}) {
 		if sub, ok := v.(*ordereddict.Dict); ok {
 			mergeLeaves(sub, out)
 		} else {
-			out[k] = v
+			out[k] = normalizeEventValue(v)
 		}
 	}
 }
@@ -350,6 +415,22 @@ func eventTimestamp(event map[string]interface{}) string {
 	sec := int64(f)
 	nsec := int64((f - float64(sec)) * 1e9)
 	return time.Unix(sec, nsec).UTC().Format(time.RFC3339Nano)
+}
+
+// eventTimeValue returns the event's TimeCreated as a time.Time (UTC), used to
+// window aggregation/correlation by event time. Returns ok=false if absent or not
+// a numeric Unix timestamp.
+func eventTimeValue(event map[string]interface{}) (time.Time, bool) {
+	v, ok := event["TimeCreated"]
+	if !ok {
+		return time.Time{}, false
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return time.Time{}, false
+	}
+	sec := int64(f)
+	return time.Unix(sec, int64((f-float64(sec))*1e9)).UTC(), true
 }
 
 func field(event map[string]interface{}, key string) string {

@@ -255,3 +255,110 @@ correlation:
 		t.Fatal("expected error when rule has no correlation section")
 	}
 }
+
+const successfulLogonRule = `
+title: Successful logon
+name: successful_logon
+detection:
+  s:
+    EventID: 4624
+  condition: s
+`
+
+// A chained correlation: an inner event_count correlation (a burst of failed
+// logons) feeds an outer temporal_ordered correlation (the burst followed by a
+// successful logon). This is the Sigma "Failed Logins Followed by Successful
+// Login" example.
+func TestCorrelationChained(t *testing.T) {
+	// Inner: >= 3 failed logons for a User within the window.
+	burst := `
+title: Failed logon burst
+name: failed_logon_burst
+correlation:
+  type: event_count
+  rules: [failed_logon]
+  group-by: [User]
+  timespan: 5m
+  condition: {gte: 3}
+`
+	// Outer: the burst, then a successful logon for the same User.
+	chained := `
+title: Burst then success
+name: burst_then_success
+correlation:
+  type: temporal_ordered
+  rules:
+    - failed_logon_burst
+    - successful_logon
+  group-by: [User]
+  timespan: 5m
+`
+	ctx := context.Background()
+
+	build := func() *CorrelationEvaluator {
+		return buildCorrelation(t, chained, failedLogonRule, successfulLogonRule, burst)
+	}
+	failed := func(user string) map[string]interface{} {
+		return map[string]interface{}{"EventID": 4625, "User": user}
+	}
+	success := func(user string) map[string]interface{} {
+		return map[string]interface{}{"EventID": 4624, "User": user}
+	}
+
+	// Correct sequence: three failures (the third fires the inner burst), then a
+	// successful logon -> the chained correlation fires.
+	c := build()
+	base := time.Now()
+	for i := 0; i < 3; i++ {
+		if res, err := c.matches(ctx, failed("alice"), base.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatal(err)
+		} else if res.Match {
+			t.Fatalf("chained correlation should not fire on failure %d", i+1)
+		}
+	}
+	res, err := c.matches(ctx, success("alice"), base.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Match {
+		t.Fatal("burst followed by successful logon should fire the chained correlation")
+	}
+	if res.GroupValues["User"] != "alice" {
+		t.Fatalf("unexpected group values %v", res.GroupValues)
+	}
+
+	// A successful logon before the burst completes must not fire (ordering), and a
+	// different user is tracked independently.
+	c2 := build()
+	if res, _ := c2.matches(ctx, success("bob"), base); res.Match {
+		t.Fatal("successful logon before any burst should not fire")
+	}
+	for i := 0; i < 3; i++ {
+		c2.matches(ctx, failed("bob"), base.Add(time.Duration(i+1)*time.Second))
+	}
+	// Only two failures for carol: the inner burst never fires, so neither does the chain.
+	c3 := build()
+	c3.matches(ctx, failed("carol"), base)
+	c3.matches(ctx, failed("carol"), base.Add(time.Second))
+	if res, _ := c3.matches(ctx, success("carol"), base.Add(2*time.Second)); res.Match {
+		t.Fatal("only two failures: inner burst should not fire, so the chain should not fire")
+	}
+}
+
+// A correlation that references itself (directly or transitively) must be rejected
+// at build time rather than recursing forever.
+func TestCorrelationCycleDetected(t *testing.T) {
+	selfRef := `
+title: Self referencing
+name: loop
+correlation:
+  type: temporal
+  rules: [loop]
+  group-by: [User]
+  timespan: 5m
+`
+	_, err := ForCorrelation(parse(t, selfRef), []sigma.Rule{parse(t, selfRef)})
+	if err == nil {
+		t.Fatal("expected a cycle error for a self-referencing correlation")
+	}
+}

@@ -86,6 +86,14 @@ Flags:
 | `-config` | Optional Sigma config file (field mappings). |
 | `-out` | Output CSV path (default: stdout). |
 | `-timeframe` | Default sliding window for aggregation rules that don't specify their own (default `1h`). |
+| `-channel-filter` | Only evaluate a rule against events from the channel its logsource targets (default `true`; faster and avoids cross-channel matches). |
+| `-exclude` | Comma-separated files of rule IDs to skip, in `<uuid> # comment` format. Accepts Hayabusa's `exclude_rules.txt`/`noisy_rules.txt` verbatim. |
+
+Event field values are normalised on ingest the way Event Viewer/Hayabusa present
+them — leading/trailing whitespace is trimmed (Windows pads fields like
+`LogonProcessName`) — and aggregation/correlation windows are keyed off each
+event's own timestamp, so `count()`/correlation results are correct when replaying
+historical logs.
 
 Each output row is one `(event, matching rule)` pair with columns:
 `timestamp, source_file, record_id, computer, channel, event_id, rule_id, rule_title, rule_level, rule_tags, event_json`.

@@ -82,6 +82,21 @@ func TestFlattenEvent_ScalarEventID(t *testing.T) {
 	}
 }
 
+// The CSV record_id comes from the System block's EventRecordID (the real,
+// global record number), not the parser's per-chunk Header.RecordID. Verify
+// flattenEvent surfaces it so field(event, "EventRecordID") returns it.
+func TestFlattenEvent_EventRecordID(t *testing.T) {
+	root := buildEvent("EventData", ordereddict.NewDict())
+	event, _ := root.Get("Event")
+	sys, _ := event.(*ordereddict.Dict).Get("System")
+	sys.(*ordereddict.Dict).Set("EventRecordID", 109446)
+
+	out := flattenEvent(root)
+	if got := field(out, "EventRecordID"); got != "109446" {
+		t.Errorf("EventRecordID = %q, want %q", got, "109446")
+	}
+}
+
 func TestEventTimestamp(t *testing.T) {
 	// The fractional part is a float64 so its sub-second digits are not exact;
 	// assert the second-resolution prefix.

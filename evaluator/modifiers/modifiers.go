@@ -257,10 +257,19 @@ func (baseComparatorCased) Matches(actual, expected any) (bool, error) {
 // wildcards written inside X. When the value has no wildcards the fast,
 // allocation-free fold helpers are used; otherwise the value is matched through the
 // shared wildcard engine (anchored regex).
+//
+// A nil actual means the field is absent from the event. An absent field has no
+// value to contain/prefix/suffix, so it never matches (only the default comparator
+// treats nil specially, matching the `null` sentinel). Without this guard a
+// wildcard value like `contains: '*'` would match every event, since CoerceString
+// turns nil into the non-empty string "<nil>".
 
 type contains struct{}
 
 func (contains) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
+		return false, nil
+	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
 		return matchWildcard(a, "*"+e+"*", false), nil
@@ -272,6 +281,9 @@ func (contains) Matches(actual, expected any) (bool, error) {
 type endswith struct{}
 
 func (endswith) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
+		return false, nil
+	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
 		return matchWildcard(a, "*"+e, false), nil
@@ -283,6 +295,9 @@ func (endswith) Matches(actual, expected any) (bool, error) {
 type startswith struct{}
 
 func (startswith) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
+		return false, nil
+	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
 		return matchWildcard(a, e+"*", false), nil
@@ -361,6 +376,9 @@ func hasSuffixFold(s, suffix string) bool {
 type containsCS struct{}
 
 func (containsCS) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
+		return false, nil
+	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
 		return matchWildcard(a, "*"+e+"*", true), nil
@@ -371,6 +389,9 @@ func (containsCS) Matches(actual, expected any) (bool, error) {
 type endswithCS struct{}
 
 func (endswithCS) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
+		return false, nil
+	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
 		return matchWildcard(a, "*"+e, true), nil
@@ -381,6 +402,9 @@ func (endswithCS) Matches(actual, expected any) (bool, error) {
 type startswithCS struct{}
 
 func (startswithCS) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
+		return false, nil
+	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
 		return matchWildcard(a, e+"*", true), nil
@@ -587,6 +611,11 @@ func CompileRegex(pattern string) (*regexp.Regexp, error) {
 }
 
 func (r re) Matches(actual any, expected any) (bool, error) {
+	if actual == nil {
+		// An absent field matches no regex (consistent with the contains family and
+		// the bundle's regex path, which both reject a nil/absent field).
+		return false, nil
+	}
 	pattern := CoerceString(expected)
 	if r.flags != "" {
 		pattern = "(?" + r.flags + ")" + pattern
