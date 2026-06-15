@@ -177,6 +177,41 @@ type MultiValueModifier interface {
 	ModifyMulti(value any) ([]any, error)
 }
 
+// ExpandValueModifiers applies the value-transforming modifiers named in modifiers
+// (e.g. windash, base64, base64offset, utf16, wide) to value and returns every
+// resulting candidate. A single value can expand into several (windash and
+// base64offset are MultiValueModifiers). Names that aren't value modifiers
+// (comparators, cased, all, exists, ...) are ignored. This mirrors the expansion
+// GetComparator does at match time, letting the batch evaluator pre-compute the
+// Aho-Corasick needles for `contains` chains that include expanding modifiers.
+func ExpandValueModifiers(value any, modifiers []string) ([]any, error) {
+	values := []any{value}
+	for _, name := range modifiers {
+		vm, ok := ValueModifiers[name]
+		if !ok {
+			continue
+		}
+		var next []any
+		for _, v := range values {
+			if multi, ok := vm.(MultiValueModifier); ok {
+				expanded, err := multi.ModifyMulti(v)
+				if err != nil {
+					return nil, err
+				}
+				next = append(next, expanded...)
+			} else {
+				modified, err := vm.Modify(v)
+				if err != nil {
+					return nil, err
+				}
+				next = append(next, modified)
+			}
+		}
+		values = next
+	}
+	return values, nil
+}
+
 var Comparators = map[string]Comparator{
 	"contains":   contains{},
 	"endswith":   endswith{},
@@ -272,7 +307,7 @@ func (contains) Matches(actual, expected any) (bool, error) {
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchWildcard(a, "*"+e+"*", false), nil
+		return matchAffix(a, e, affixContains, false), nil
 	}
 	// The Sigma spec defines that by default comparisons are case-insensitive
 	return containsFold(a, e), nil
@@ -286,7 +321,7 @@ func (endswith) Matches(actual, expected any) (bool, error) {
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchWildcard(a, "*"+e, false), nil
+		return matchAffix(a, e, affixSuffix, false), nil
 	}
 	// The Sigma spec defines that by default comparisons are case-insensitive
 	return hasSuffixFold(a, e), nil
@@ -300,7 +335,7 @@ func (startswith) Matches(actual, expected any) (bool, error) {
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchWildcard(a, e+"*", false), nil
+		return matchAffix(a, e, affixPrefix, false), nil
 	}
 	// The Sigma spec defines that by default comparisons are case-insensitive
 	return hasPrefixFold(a, e), nil
@@ -381,7 +416,7 @@ func (containsCS) Matches(actual, expected any) (bool, error) {
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchWildcard(a, "*"+e+"*", true), nil
+		return matchAffix(a, e, affixContains, true), nil
 	}
 	return strings.Contains(a, e), nil
 }
@@ -394,7 +429,7 @@ func (endswithCS) Matches(actual, expected any) (bool, error) {
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchWildcard(a, "*"+e, true), nil
+		return matchAffix(a, e, affixSuffix, true), nil
 	}
 	return strings.HasSuffix(a, e), nil
 }
@@ -407,7 +442,7 @@ func (startswithCS) Matches(actual, expected any) (bool, error) {
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchWildcard(a, e+"*", true), nil
+		return matchAffix(a, e, affixPrefix, true), nil
 	}
 	return strings.HasPrefix(a, e), nil
 }

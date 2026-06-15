@@ -57,6 +57,109 @@ detection:
 	}
 }
 
+// A literal `%` value (e.g. `CommandLine|contains: '%'`, a common way to detect
+// environment variables) must not be mistaken for a `%name%` placeholder. The bug
+// made the whole rule error out ("can't expand %") and get skipped.
+func TestLiteralPercentNotPlaceholder(t *testing.T) {
+	rule := mustRule(t, `
+title: literal percent
+detection:
+  s:
+    CommandLine|contains: '%'
+  condition: s
+`)
+	ctx := context.Background()
+	cases := []struct {
+		cmd       string
+		wantMatch bool
+	}{
+		{`echo %USERNAME%`, true},
+		{`cscript /nologo x.vbs`, false},
+	}
+	for _, tc := range cases {
+		event := map[string]interface{}{"CommandLine": tc.cmd}
+		// No placeholder expander configured: must not error.
+		res, err := ForRule(rule).Matches(ctx, event)
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", tc.cmd, err)
+		}
+		if res.Match != tc.wantMatch {
+			t.Errorf("%q: single-rule match=%v want %v", tc.cmd, res.Match, tc.wantMatch)
+		}
+		results, err := ForRules([]sigma.Rule{rule}).Matches(ctx, event)
+		if err != nil {
+			t.Fatalf("%q: bundle error: %v", tc.cmd, err)
+		}
+		got := len(results) == 1 && results[0].Match
+		if got != tc.wantMatch {
+			t.Errorf("%q: bundle match=%v want %v", tc.cmd, got, tc.wantMatch)
+		}
+	}
+}
+
+// `windash|contains` must work in the batch bundle path: the value modifier
+// expands `-c` into `/c` etc., and those expansions must be in the Aho-Corasick
+// needle set, otherwise the bundle misses events that use a non-hyphen variant.
+func TestWindashContainsBundle(t *testing.T) {
+	rule := mustRule(t, `
+title: windash contains
+detection:
+  s:
+    ImagePath|contains|windash: ' -c '
+  condition: s
+`)
+	ctx := context.Background()
+	// Event uses "/c" (a windash variant of "-c").
+	event := map[string]interface{}{"ImagePath": `C:\Windows\System32\cmd.exe /c powershell`}
+
+	single, err := ForRule(rule).Matches(ctx, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := ForRules([]sigma.Rule{rule}).Matches(ctx, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := len(results) == 1 && results[0].Match
+	if !single.Match || !bundle {
+		t.Fatalf("windash|contains '/c': single=%v bundle=%v, want both true", single.Match, bundle)
+	}
+}
+
+// A contains value with a wildcard and a trailing backslash (e.g.
+// `>?C:\Windows\Temp\`) must match. Padding the value with a literal `*` used to
+// turn the trailing `\` + `*` into an escaped `\*`, breaking the match.
+func TestWildcardContainsTrailingBackslash(t *testing.T) {
+	rule := mustRule(t, `
+title: trailing backslash
+detection:
+  s:
+    CommandLine|contains:
+      - '>?C:\Windows\Temp\'
+  condition: s
+`)
+	ctx := context.Background()
+	cases := []struct {
+		name      string
+		cmd       string
+		wantMatch bool
+	}{
+		{"redirect into temp", `cmd.exe /C whoami > C:\Windows\Temp\x.tmp 2>&1`, true},
+		{"different dir does not match", `cmd.exe /C whoami > C:\Users\bob\x.tmp`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event := map[string]interface{}{"CommandLine": tc.cmd}
+			single, _ := ForRule(rule).Matches(ctx, event)
+			results, _ := ForRules([]sigma.Rule{rule}).Matches(ctx, event)
+			bundle := len(results) == 1 && results[0].Match
+			if single.Match != tc.wantMatch || bundle != tc.wantMatch {
+				t.Fatalf("single=%v bundle=%v, want %v", single.Match, bundle, tc.wantMatch)
+			}
+		})
+	}
+}
+
 // Wildcards (`*`/`?`) inside contains/startswith/endswith values must be honoured
 // in both the single-rule path and the batch bundle path (whose Aho-Corasick
 // contains optimisation can't handle wildcards and must fall back).

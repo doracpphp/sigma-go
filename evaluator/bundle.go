@@ -48,16 +48,25 @@ func ForRules(rules []sigma.Rule, options ...Option) RuleEvaluatorBundle {
 							if value == nil {
 								continue
 							}
-							stringValue := modifiers.CoerceString(value)
-							// Wildcard values aren't literal substrings; they're matched
-							// via the fallback comparator, so they don't belong in the trie.
-							if modifiers.HasUnescapedWildcard(stringValue) {
+							// Expand any value modifiers (windash, base64offset, ...) so
+							// their candidate strings are in the trie too - the comparator
+							// looks up the expanded value at match time, not the raw one.
+							expanded, err := modifiers.ExpandValueModifiers(value, fieldMatcher.Modifiers)
+							if err != nil {
 								continue
 							}
-							if !bundle.caseSensitive {
-								stringValue = strings.ToLower(stringValue)
+							for _, ev := range expanded {
+								stringValue := modifiers.CoerceString(ev)
+								// Wildcard values aren't literal substrings; they're matched
+								// via the fallback comparator, so they don't belong in the trie.
+								if modifiers.HasUnescapedWildcard(stringValue) {
+									continue
+								}
+								if !bundle.caseSensitive {
+									stringValue = strings.ToLower(stringValue)
+								}
+								values[fieldMatcher.Field] = append(values[fieldMatcher.Field], stringValue)
 							}
-							values[fieldMatcher.Field] = append(values[fieldMatcher.Field], stringValue)
 						}
 					case regex: // get "necessary" substrings and add to the needle set
 						for _, value := range fieldMatcher.Values {

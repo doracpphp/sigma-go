@@ -292,8 +292,10 @@ func (rule *RuleEvaluator) getMatcherValues(ctx context.Context, matcher sigma.F
 		}
 
 		switch {
-		case strings.HasPrefix(value, "%") && strings.HasSuffix(value, "%"):
-			// The whole value is a placeholder; expand it to its values.
+		case len(value) > 2 && strings.HasPrefix(value, "%") && strings.HasSuffix(value, "%"):
+			// The whole value is a placeholder; expand it to its values. A bare "%"
+			// or "%%" is a literal percent (e.g. `CommandLine|contains: '%'` to detect
+			// environment variables), not a `%name%` placeholder.
 			if rule.expandPlaceholder == nil {
 				return nil, fmt.Errorf("can't expand %s, no placeholder expander function defined", value)
 			}
