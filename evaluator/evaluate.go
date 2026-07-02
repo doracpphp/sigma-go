@@ -68,6 +68,13 @@ type GroupedByValues struct {
 	ConditionID int // TODO: there's some forward/backward compatibility pitfalls here: what happens if you switch the order of conditions in your Sigma file?
 	EventValues map[string]interface{}
 
+	// RuleID identifies the rule this aggregation belongs to (the rule's ID, or
+	// its name/title when no ID is set). Without it, two different rules with the
+	// same condition shape and group-by values would share one aggregation bucket
+	// when evaluated through the same aggregator (e.g. a bundle), cross-counting
+	// each other's events.
+	RuleID string
+
 	// Timeframe is the sliding window (taken from the rule's `detection.timeframe`)
 	// over which this aggregation should be calculated. It is zero if the rule
 	// doesn't specify a timeframe, in which case the aggregation implementation
@@ -78,6 +85,7 @@ type GroupedByValues struct {
 func (a GroupedByValues) Key() string {
 	// This is lazy and a terrible idea as the JSON output shouldn't be relied on to be stable across Go releases
 	out, err := json.Marshal(map[string]interface{}{
+		"rule_id":      a.RuleID,
 		"condition_id": a.ConditionID,
 		"event_values": a.EventValues,
 		"timeframe":    a.Timeframe,
@@ -169,10 +177,16 @@ func (rule RuleEvaluator) matches(ctx context.Context, event Event, comparators 
 	}
 	// For `near` aggregations the match time of each referenced search must be
 	// recorded on every event (not only when the left-hand search matches), so do
-	// it up front using a single consistent timestamp for this event.
+	// it up front using a single consistent timestamp for this event. Like the
+	// aggregators and correlations, prefer the event's own timestamp from the
+	// context (correct for offline replay) over wall-clock arrival time.
 	var nearNow time.Time
 	if len(rule.nearIdentifiers) > 0 {
-		nearNow = rule.nowFunc()
+		if t, ok := EventTimeFromContext(ctx); ok {
+			nearNow = t
+		} else {
+			nearNow = rule.nowFunc()
+		}
 		rule.nearState.mu.Lock()
 		for _, id := range rule.nearIdentifiers {
 			if searchResults(id) {

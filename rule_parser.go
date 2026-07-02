@@ -2,6 +2,7 @@ package sigma
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,14 +74,20 @@ func (d *Detection) UnmarshalYAML(node *yaml.Node) error {
 				return err
 			}
 			// Sigma timeframes are a number with a single s/m/h/d unit; `d` isn't
-			// valid Go duration syntax. Fall back to Go syntax for backwards
-			// compatibility with values like "1h30m".
+			// valid Go duration syntax. Fall back to Go syntax for values like
+			// "1h30m", then to a bare integer nanosecond count, which yaml.v3's
+			// native time.Duration decoding accepted in earlier versions.
 			timeframe, err := ParseTimespan(raw)
 			if err != nil {
 				timeframe, err = time.ParseDuration(raw)
-				if err != nil {
-					return fmt.Errorf("invalid timeframe %q", raw)
+			}
+			if err != nil {
+				if n, intErr := strconv.ParseInt(raw, 10, 64); intErr == nil {
+					timeframe, err = time.Duration(n), nil
 				}
+			}
+			if err != nil {
+				return fmt.Errorf("invalid timeframe %q", raw)
 			}
 			d.Timeframe = timeframe
 		default:

@@ -62,6 +62,9 @@ func ForRules(rules []sigma.Rule, options ...Option) RuleEvaluatorBundle {
 								if modifiers.HasUnescapedWildcard(stringValue) {
 									continue
 								}
+								// Resolve escapes (\*, \?, \\) so the trie holds the literal
+								// substring the comparator searches for.
+								stringValue = modifiers.UnescapeValue(stringValue)
 								if !bundle.caseSensitive {
 									stringValue = strings.ToLower(stringValue)
 								}
@@ -86,9 +89,13 @@ func ForRules(rules []sigma.Rule, options ...Option) RuleEvaluatorBundle {
 	}
 
 	for field, fieldValues := range values {
+		patterns := map[string]bool{}
+		for _, v := range fieldValues {
+			patterns[v] = true
+		}
 		bundle.ahocorasick[field] = ahocorasickSearcher{
 			Trie:     aho_corasick.NewTrieBuilder().AddStrings(fieldValues).Build(),
-			patterns: fieldValues,
+			patterns: patterns,
 		}
 	}
 	return bundle
@@ -102,14 +109,30 @@ type RuleEvaluatorBundle struct {
 
 type ahocorasickSearcher struct {
 	*aho_corasick.Trie
-	patterns []string
+	// patterns is the set of needles the trie was built from. A needle outside
+	// this set can never be found by the trie, so the comparator falls back to a
+	// plain comparison for it (e.g. placeholder- or fieldref-derived values that
+	// only exist at match time).
+	patterns map[string]bool
+}
+
+// resultsKey identifies one cached trie scan: the field, the identity of the
+// scanned string and whether the scan was case-sensitive. Case sensitivity must
+// be part of the key because a case-insensitive scan lowercases the haystack
+// and therefore produces a different match set than a case-sensitive one.
+type resultsKey struct {
+	field         string
+	data          *byte
+	caseSensitive bool
 }
 
 func (a *ahocorasickContains) getResults(field, s string, caseSensitive bool) map[string]bool {
-	as := a.matchers[field]
-	key := unsafe.StringData(s) // using the underlying []byte pointer means we only compute results once per interned string
-	result, ok := a.results[field][key]
-	if ok {
+	as, ok := a.matchers[field]
+	if !ok || as.Trie == nil {
+		return nil
+	}
+	key := resultsKey{field, unsafe.StringData(s), caseSensitive} // using the underlying []byte pointer means we only compute results once per interned string
+	if result, ok := a.results[key]; ok {
 		return result
 	}
 
@@ -118,13 +141,9 @@ func (a *ahocorasickContains) getResults(field, s string, caseSensitive bool) ma
 		s = strings.ToLower(s)
 	}
 	results := map[string]bool{}
-	if _, ok := a.results[field]; !ok {
-		a.results[field] = map[*byte]map[string]bool{}
-	}
-	a.results[field][key] = results
+	a.results[key] = results
 	for _, match := range as.MatchString(s) {
-		// TODO: is match.MatchString equivalent to matcher.patterns[match.Pattern()]?
-		a.results[field][key][match.MatchString()] = true
+		results[match.MatchString()] = true
 	}
 	return results
 }
@@ -147,7 +166,8 @@ func (bundle RuleEvaluatorBundle) Matches(ctx context.Context, event Event) ([]R
 
 	// override the contains comparator to use our custom one. The embedded
 	// Comparator is the standard contains comparator, used as a fallback for
-	// wildcard values that can't be looked up in the Aho-Corasick trie.
+	// values that can't be looked up in the Aho-Corasick trie (wildcards, or
+	// values derived at match time such as placeholder/fieldref expansions).
 	fallback := modifiers.Comparators["contains"]
 	if bundle.caseSensitive {
 		fallback = modifiers.ComparatorsCaseSensitive["contains"]
@@ -156,7 +176,7 @@ func (bundle RuleEvaluatorBundle) Matches(ctx context.Context, event Event) ([]R
 		Comparator:    fallback,
 		matchers:      bundle.ahocorasick,
 		caseSensitive: bundle.caseSensitive,
-		results:       map[string]map[*byte]map[string]bool{},
+		results:       map[resultsKey]map[string]bool{},
 	}
 	comparators["contains"] = contains
 	comparators["re"] = &ahocorasickRe{
@@ -183,7 +203,7 @@ type ahocorasickContains struct {
 	caseSensitive bool
 	modifiers.Comparator
 	matchers map[string]ahocorasickSearcher
-	results  map[string]map[*byte]map[string]bool
+	results  map[resultsKey]map[string]bool
 }
 
 func (a *ahocorasickContains) MatchesField(field string, actual any, expected any) (bool, error) {
@@ -208,25 +228,23 @@ func (a *ahocorasickContains) MatchesField(field string, actual any, expected an
 		return a.Comparator.Matches(actual, expected)
 	}
 
-	results := a.getResults(field, modifiers.CoerceString(actual), a.caseSensitive)
+	// The trie was built from unescaped (and, in case-insensitive mode, lowercased)
+	// rule values; canonicalise the needle the same way before looking it up.
+	needle = modifiers.UnescapeValue(needle)
 	if !a.caseSensitive {
-		// when operating in case-insensitive mode, search strings must be canonicalised.
-		// Needles are rule values (bounded cardinality) but this runs once per value
-		// per event, so cache the lowercasing instead of re-allocating every time.
-		needle = lowerCached(needle)
+		needle = strings.ToLower(needle)
 	}
+
+	// A needle the trie wasn't built with (a placeholder or fieldref value that
+	// only exists at match time, or a field whose values were all skipped at build
+	// time) can never be found by the trie; match it with the standard comparator.
+	searcher, ok := a.matchers[field]
+	if !ok || searcher.Trie == nil || !searcher.patterns[needle] {
+		return a.Comparator.Matches(actual, expected)
+	}
+
+	results := a.getResults(field, modifiers.CoerceString(actual), a.caseSensitive)
 	return results[needle], nil
-}
-
-var loweredNeedles sync.Map // map[string]string
-
-func lowerCached(s string) string {
-	if cached, ok := loweredNeedles.Load(s); ok {
-		return cached.(string)
-	}
-	lowered := strings.ToLower(s)
-	loweredNeedles.Store(s, lowered)
-	return lowered
 }
 
 type ahocorasickRe struct {
@@ -267,6 +285,10 @@ func getRegexInfo(pattern string) (*regexInfo, error) {
 }
 
 func (a *ahocorasickRe) MatchesField(field string, actual any, expected any) (bool, error) {
+	if actual == nil {
+		// An absent field matches no regex (mirrors the standard re comparator).
+		return false, nil
+	}
 	stringRe := modifiers.CoerceString(expected)
 	info, err := getRegexInfo(stringRe)
 	if err != nil {
@@ -275,16 +297,24 @@ func (a *ahocorasickRe) MatchesField(field string, actual any, expected any) (bo
 	re, ss, caseInsensitive := info.re, info.necessary, info.caseInsensitive
 
 	haystack := modifiers.CoerceString(actual)
-	results := a.getResults(field, haystack, !caseInsensitive)
-	found := false
-	for _, s := range ss {
-		if results[s] {
-			found = true
-			break
+
+	// The trie prefilter only applies when this pattern has necessary substrings
+	// and the field has a trie holding them; otherwise run the regex directly
+	// (e.g. `.+`, which has no necessary substrings and may have contributed
+	// nothing to the trie).
+	if len(ss) > 0 {
+		if results := a.getResults(field, haystack, !caseInsensitive); results != nil {
+			found := false
+			for _, s := range ss {
+				if results[s] {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false, nil
+			}
 		}
-	}
-	if !found {
-		return false, nil
 	}
 
 	// our cheap heuristic says the regex *might* match the string,

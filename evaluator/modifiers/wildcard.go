@@ -15,11 +15,11 @@ import (
 //   - `\\*` is a plain backslash followed by a wildcard
 //   - `\\\*` is a plain backslash followed by a literal `*`
 //
-// wildcardMatcher is the compiled form of one rule value: either a plain
-// (unescaped) literal, or anchored regexes when the value contains wildcards.
+// wildcardMatcher is the compiled form of one rule value containing wildcards:
+// its anchored case-sensitive and case-insensitive regexes. Values without
+// wildcards never reach the cache (matchWildcard compares them directly).
 type wildcardMatcher struct {
-	literal     string         // the unescaped value; used when there are no wildcards
-	sensitive   *regexp.Regexp // nil if the value contains no wildcards
+	sensitive   *regexp.Regexp
 	insensitive *regexp.Regexp
 }
 
@@ -43,15 +43,63 @@ func HasUnescapedWildcard(s string) bool {
 	return false
 }
 
+// UnescapeValue resolves the escape sequences above into the literal string
+// they denote: `\*` -> `*`, `\?` -> `?`, `\\` -> `\`; a backslash before any
+// other character is a plain backslash and is kept. It must only be applied to
+// values without unescaped wildcards (see HasUnescapedWildcard).
+func UnescapeValue(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) {
+			if next := s[i+1]; next == '*' || next == '?' || next == '\\' {
+				b.WriteByte(next)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// EscapeValue is the inverse of UnescapeValue: it escapes every `*`, `?` and
+// `\` in s so the result is matched as the literal string s by the wildcard
+// engine. Used for values that come from event data (fieldref), which must
+// never be interpreted as patterns.
+func EscapeValue(s string) string {
+	if !strings.ContainsAny(s, `*?\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) * 2)
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '*', '?', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 // matchWildcard reports whether actual matches the Sigma value expected,
 // applying the wildcard and escaping rules above. Values without wildcards are
-// compared for (case-insensitive by default) string equality.
+// compared for (case-insensitive by default) string equality; this path never
+// touches the pattern cache, so event-derived values (fieldref) can't grow it.
 func matchWildcard(actual, expected string, caseSensitive bool) bool {
-	if !strings.ContainsAny(expected, `*?\`) {
+	if !HasUnescapedWildcard(expected) {
+		literal := UnescapeValue(expected)
 		if caseSensitive {
-			return expected == actual
+			return literal == actual
 		}
-		return strings.EqualFold(expected, actual)
+		return strings.EqualFold(literal, actual)
 	}
 
 	cached, ok := wildcardMatchers.Load(expected)
@@ -60,12 +108,6 @@ func matchWildcard(actual, expected string, caseSensitive bool) bool {
 	}
 	m := cached.(*wildcardMatcher)
 
-	if m.sensitive == nil {
-		if caseSensitive {
-			return m.literal == actual
-		}
-		return strings.EqualFold(m.literal, actual)
-	}
 	if caseSensitive {
 		return m.sensitive.MatchString(actual)
 	}
@@ -73,40 +115,12 @@ func matchWildcard(actual, expected string, caseSensitive bool) bool {
 }
 
 func compileWildcard(value string) *wildcardMatcher {
-	var literal, pattern strings.Builder
-	hasWildcard := false
-	runes := []rune(value)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		if r == '\\' && i+1 < len(runes) {
-			if next := runes[i+1]; next == '*' || next == '?' || next == '\\' {
-				literal.WriteRune(next)
-				pattern.WriteString(regexp.QuoteMeta(string(next)))
-				i++
-				continue
-			}
-			// A single backslash before a plain character is a plain backslash.
-		}
-		switch r {
-		case '*':
-			hasWildcard = true
-			pattern.WriteString(".*")
-		case '?':
-			hasWildcard = true
-			pattern.WriteString(".")
-		default:
-			literal.WriteRune(r)
-			pattern.WriteString(regexp.QuoteMeta(string(r)))
-		}
+	// (?s) so `*`/`?` also span newlines; \A/\z anchor to the whole value.
+	pattern := wildcardRegexpBody(value)
+	return &wildcardMatcher{
+		sensitive:   regexp.MustCompile(`(?s)\A` + pattern + `\z`),
+		insensitive: regexp.MustCompile(`(?is)\A` + pattern + `\z`),
 	}
-
-	m := &wildcardMatcher{literal: literal.String()}
-	if hasWildcard {
-		// (?s) so `*`/`?` also span newlines; \A/\z anchor to the whole value.
-		m.sensitive = regexp.MustCompile(`(?s)\A` + pattern.String() + `\z`)
-		m.insensitive = regexp.MustCompile(`(?is)\A` + pattern.String() + `\z`)
-	}
-	return m
 }
 
 // affixKind selects how a contains/startswith/endswith value is anchored.

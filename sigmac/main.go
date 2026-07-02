@@ -50,9 +50,18 @@ func main() {
 	}
 
 	// Parse flags and positional arguments in any order (Go's flag package
-	// otherwise stops at the first positional argument).
+	// otherwise stops at the first positional argument). Everything after a
+	// bare `--` is taken verbatim as positional arguments, so filenames that
+	// start with a dash work.
 	var inputs []string
 	args := os.Args[1:]
+	for i, a := range args {
+		if a == "--" {
+			inputs = append(inputs, args[i+1:]...)
+			args = args[:i]
+			break
+		}
+	}
 	for len(args) > 0 {
 		if err := fs.Parse(args); err != nil {
 			os.Exit(2)
@@ -250,6 +259,7 @@ func scanFile(ctx context.Context, path string, bundle evaluator.RuleEvaluatorBu
 				return scanned, matched, err
 			}
 			for _, row := range rows {
+				sanitizeCSVRow(row)
 				if err := w.Write(row); err != nil {
 					return scanned, matched, err
 				}
@@ -440,6 +450,22 @@ func field(event map[string]interface{}, key string) string {
 	return ""
 }
 
+// sanitizeCSVRow guards against CSV formula injection: event field values are
+// attacker-controlled and a cell beginning with =, +, - or @ (or a stray
+// tab/CR) is executed as a formula when the CSV is opened in Excel/LibreOffice.
+// Such cells are prefixed with a single quote, the conventional neutralizer.
+func sanitizeCSVRow(row []string) {
+	for i, cell := range row {
+		if cell == "" {
+			continue
+		}
+		switch cell[0] {
+		case '=', '+', '-', '@', '\t', '\r':
+			row[i] = "'" + cell
+		}
+	}
+}
+
 func toJSON(event map[string]interface{}) string {
 	b, err := json.Marshal(event)
 	if err != nil {
@@ -459,7 +485,10 @@ func hasAggregation(rules []sigma.Rule) bool {
 	return false
 }
 
-var yamlDocSep = regexp.MustCompile(`(?m)^---[ \t]*$`)
+// yamlDocSep matches a YAML document separator line: `---` optionally followed
+// by whitespace and a comment (`--- # second rule` is a legal separator; missing
+// it would silently drop every rule after it).
+var yamlDocSep = regexp.MustCompile(`(?m)^---(?:[ \t]+(?:#.*)?)?$`)
 
 // loadRules reads every .yml/.yaml file under path (or path itself if it is a
 // file) and parses each YAML document into a Sigma rule. Files that fail to

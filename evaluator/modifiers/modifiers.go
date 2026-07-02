@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -96,6 +97,19 @@ func GetComparator(field string, comparators map[string]Comparator, modifiers ..
 		comparator = defaultComparator
 	}
 
+	// The value-modifier names form the cache key for expanded values: the
+	// expansion depends only on the rule value and the chain, not on the event.
+	var chain string
+	if len(valueModifiers) > 0 {
+		names := make([]string, 0, len(valueModifiers))
+		for _, modifier := range modifiers {
+			if _, ok := ValueModifiers[modifier]; ok {
+				names = append(names, modifier)
+			}
+		}
+		chain = strings.Join(names, "|")
+	}
+
 	return func(actual, expected any) (bool, error) {
 		var err error
 		for _, modifier := range eventValueModifiers {
@@ -107,27 +121,16 @@ func GetComparator(field string, comparators map[string]Comparator, modifiers ..
 
 		// Value modifiers are applied left to right. Most map a single value to a
 		// single value, but some (e.g. base64offset, windash) expand one value into
-		// several candidate values. We thread a list through the chain so that any
-		// expansion is flat-mapped, and the field matches if it matches ANY candidate.
+		// several candidate values, so the value expands into a flat list and the
+		// field matches if it matches ANY candidate. This runs once per event per
+		// value, so the (chain, value)-keyed cache matters: windash alone can
+		// produce hundreds of candidate strings.
 		expectedValues := []any{expected}
-		for _, modifier := range valueModifiers {
-			var next []any
-			for _, value := range expectedValues {
-				if multi, ok := modifier.(MultiValueModifier); ok {
-					expanded, err := multi.ModifyMulti(value)
-					if err != nil {
-						return false, err
-					}
-					next = append(next, expanded...)
-				} else {
-					modified, err := modifier.Modify(value)
-					if err != nil {
-						return false, err
-					}
-					next = append(next, modified)
-				}
+		if len(valueModifiers) > 0 {
+			expectedValues, err = expandCached(chain, expected, valueModifiers)
+			if err != nil {
+				return false, err
 			}
-			expectedValues = next
 		}
 
 		for _, value := range expectedValues {
@@ -185,12 +188,20 @@ type MultiValueModifier interface {
 // GetComparator does at match time, letting the batch evaluator pre-compute the
 // Aho-Corasick needles for `contains` chains that include expanding modifiers.
 func ExpandValueModifiers(value any, modifiers []string) ([]any, error) {
-	values := []any{value}
+	var vms []ValueModifier
 	for _, name := range modifiers {
-		vm, ok := ValueModifiers[name]
-		if !ok {
-			continue
+		if vm, ok := ValueModifiers[name]; ok {
+			vms = append(vms, vm)
 		}
+	}
+	return applyValueModifiers(value, vms)
+}
+
+// applyValueModifiers flat-maps value through the modifier chain (see
+// ExpandValueModifiers).
+func applyValueModifiers(value any, modifiers []ValueModifier) ([]any, error) {
+	values := []any{value}
+	for _, vm := range modifiers {
 		var next []any
 		for _, v := range values {
 			if multi, ok := vm.(MultiValueModifier); ok {
@@ -210,6 +221,43 @@ func ExpandValueModifiers(value any, modifiers []string) ([]any, error) {
 		values = next
 	}
 	return values, nil
+}
+
+// expansionCache memoises applyValueModifiers keyed by (modifier chain, value).
+// Values normally come from rules, so the cardinality is bounded by the loaded
+// ruleset; the size cap guards the degenerate case of a value-modifier chain fed
+// event-derived values (e.g. combined with fieldref), which must not grow the
+// cache without bound.
+var expansionCache sync.Map // map[expansionKey][]any
+var expansionCacheSize int64
+
+type expansionKey struct {
+	chain string
+	value string
+}
+
+const expansionCacheMaxEntries = 1 << 16
+
+func expandCached(chain string, value any, modifiers []ValueModifier) ([]any, error) {
+	str, isString := value.(string)
+	if !isString {
+		// Non-string values (ints, bools) are cheap to expand and rare; skip caching.
+		return applyValueModifiers(value, modifiers)
+	}
+	key := expansionKey{chain: chain, value: str}
+	if cached, ok := expansionCache.Load(key); ok {
+		return cached.([]any), nil
+	}
+	expanded, err := applyValueModifiers(value, modifiers)
+	if err != nil {
+		return nil, err
+	}
+	if atomic.LoadInt64(&expansionCacheSize) < expansionCacheMaxEntries {
+		if _, loaded := expansionCache.LoadOrStore(key, expanded); !loaded {
+			atomic.AddInt64(&expansionCacheSize, 1)
+		}
+	}
+	return expanded, nil
 }
 
 var Comparators = map[string]Comparator{
@@ -309,8 +357,10 @@ func (contains) Matches(actual, expected any) (bool, error) {
 	if HasUnescapedWildcard(e) {
 		return matchAffix(a, e, affixContains, false), nil
 	}
-	// The Sigma spec defines that by default comparisons are case-insensitive
-	return containsFold(a, e), nil
+	// The Sigma spec defines that by default comparisons are case-insensitive.
+	// No unescaped wildcards: resolve escapes (\*, \?, \\) to their literal
+	// characters before the plain substring search.
+	return containsFold(a, UnescapeValue(e)), nil
 }
 
 type endswith struct{}
@@ -324,7 +374,7 @@ func (endswith) Matches(actual, expected any) (bool, error) {
 		return matchAffix(a, e, affixSuffix, false), nil
 	}
 	// The Sigma spec defines that by default comparisons are case-insensitive
-	return hasSuffixFold(a, e), nil
+	return hasSuffixFold(a, UnescapeValue(e)), nil
 }
 
 type startswith struct{}
@@ -338,7 +388,7 @@ func (startswith) Matches(actual, expected any) (bool, error) {
 		return matchAffix(a, e, affixPrefix, false), nil
 	}
 	// The Sigma spec defines that by default comparisons are case-insensitive
-	return hasPrefixFold(a, e), nil
+	return hasPrefixFold(a, UnescapeValue(e)), nil
 }
 
 // The case-insensitive comparators run once per rule value per event, so the
@@ -418,7 +468,7 @@ func (containsCS) Matches(actual, expected any) (bool, error) {
 	if HasUnescapedWildcard(e) {
 		return matchAffix(a, e, affixContains, true), nil
 	}
-	return strings.Contains(a, e), nil
+	return strings.Contains(a, UnescapeValue(e)), nil
 }
 
 type endswithCS struct{}
@@ -431,7 +481,7 @@ func (endswithCS) Matches(actual, expected any) (bool, error) {
 	if HasUnescapedWildcard(e) {
 		return matchAffix(a, e, affixSuffix, true), nil
 	}
-	return strings.HasSuffix(a, e), nil
+	return strings.HasSuffix(a, UnescapeValue(e)), nil
 }
 
 type startswithCS struct{}
@@ -444,7 +494,7 @@ func (startswithCS) Matches(actual, expected any) (bool, error) {
 	if HasUnescapedWildcard(e) {
 		return matchAffix(a, e, affixPrefix, true), nil
 	}
-	return strings.HasPrefix(a, e), nil
+	return strings.HasPrefix(a, UnescapeValue(e)), nil
 }
 
 type b64 struct{}

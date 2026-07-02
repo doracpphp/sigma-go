@@ -75,6 +75,11 @@ func forCorrelation(rule sigma.Rule, referencedRules []sigma.Rule, visiting map[
 	if correlation.Type == sigma.CorrelationValueCount && correlation.Condition.Field == "" {
 		return nil, fmt.Errorf("value_count correlation requires condition.field")
 	}
+	if correlation.Timespan.Duration() <= 0 {
+		// The spec makes timespan mandatory; without one the sliding window is
+		// empty and the correlation would silently never fire.
+		return nil, fmt.Errorf("correlation requires a positive timespan (e.g. \"5m\")")
+	}
 
 	lookup := map[string]sigma.Rule{}
 	for _, r := range referencedRules {
@@ -184,13 +189,20 @@ func (c *CorrelationEvaluator) matches(ctx context.Context, event Event, now tim
 	key, groupValues := c.groupKey(event, matched, childGroupValues)
 
 	value := ""
+	hasValue := false
 	if c.correlation.Condition != nil && c.correlation.Condition.Field != "" {
-		value = fmt.Sprint(eventValue(event, c.correlation.Condition.Field))
+		// An absent field must not be counted as a distinct value (a password-spray
+		// rule would otherwise count "<nil>" as an extra user).
+		if field := c.correlation.Condition.Field; eventKeyExists(event, field) {
+			value = fmt.Sprint(eventValue(event, field))
+			hasValue = true
+		}
 	}
 
 	fired := c.state.observe(now, key, observation{
-		rules: matched,
-		value: value,
+		rules:    matched,
+		value:    value,
+		hasValue: hasValue,
 	}, c.correlation, len(c.referenced))
 
 	return CorrelationResult{Match: fired, GroupValues: groupValues}, nil
@@ -211,14 +223,25 @@ func (c *CorrelationEvaluator) groupKey(event Event, matched map[int]bool, overr
 		} else {
 			actualField := field
 			if aliasMap, ok := c.correlation.Aliases[field]; ok {
-				for idx := range matched {
+				// Walk the referenced rules in declaration order so that an event
+				// matching several of them always resolves the alias to the same
+				// field (map iteration order would make bucketing nondeterministic).
+				for idx := range c.referenced {
+					if !matched[idx] {
+						continue
+					}
 					if concrete, ok := aliasMap[c.referenced[idx].ref]; ok {
 						actualField = concrete
 						break
 					}
 				}
 			}
-			v = eventValue(event, actualField)
+			// Distinguish "field absent" from any real value, and do it the same
+			// way for map[string]string and map[string]interface{} events so both
+			// land in the same bucket.
+			if eventKeyExists(event, actualField) {
+				v = eventValue(event, actualField)
+			}
 		}
 		values[field] = v
 		b.WriteString(field)
@@ -230,8 +253,9 @@ func (c *CorrelationEvaluator) groupKey(event Event, matched map[int]bool, overr
 }
 
 type observation struct {
-	rules map[int]bool
-	value string
+	rules    map[int]bool
+	value    string
+	hasValue bool
 }
 
 type correlationState struct {
@@ -274,9 +298,10 @@ type corrGroup struct {
 }
 
 type corrEvent struct {
-	at    time.Time
-	rules map[int]bool
-	value string
+	at       time.Time
+	rules    map[int]bool
+	value    string
+	hasValue bool
 }
 
 func (s *correlationState) observe(now time.Time, key string, obs observation, correlation sigma.Correlation, numRules int) bool {
@@ -290,10 +315,23 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 		g = &corrGroup{}
 		s.groups[key] = g
 	}
-	g.events = append(g.events, corrEvent{at: now, rules: obs.rules, value: obs.value})
 
-	// Drop events that have aged out of the sliding window.
-	cutoff := now.Add(-correlation.Timespan.Duration())
+	// Insert in event-time order so temporal_ordered sees the true chronology even
+	// when events arrive out of order (multi-source ingestion, replay), and so the
+	// newest event is always last (the sweep relies on that). Events almost always
+	// arrive in order, so this is an append in the common case.
+	ev := corrEvent{at: now, rules: obs.rules, value: obs.value, hasValue: obs.hasValue}
+	pos := len(g.events)
+	for pos > 0 && g.events[pos-1].at.After(now) {
+		pos--
+	}
+	g.events = append(g.events, corrEvent{})
+	copy(g.events[pos+1:], g.events[pos:])
+	g.events[pos] = ev
+
+	// Drop events that have aged out of the sliding window (relative to the newest
+	// event, which with sorted insertion is the last one).
+	cutoff := g.events[len(g.events)-1].at.Add(-correlation.Timespan.Duration())
 	kept := g.events[:0]
 	for _, e := range g.events {
 		if !e.at.Before(cutoff) {
@@ -302,16 +340,19 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 	}
 	g.events = kept
 
+	fired := false
 	switch correlation.Type {
 	case sigma.CorrelationEventCount:
-		return compareCount(len(g.events), correlation.Condition)
+		fired = compareCount(len(g.events), correlation.Condition)
 
 	case sigma.CorrelationValueCount:
 		distinct := map[string]struct{}{}
 		for _, e := range g.events {
-			distinct[e.value] = struct{}{}
+			if e.hasValue {
+				distinct[e.value] = struct{}{}
+			}
 		}
-		return compareCount(len(distinct), correlation.Condition)
+		fired = compareCount(len(distinct), correlation.Condition)
 
 	case sigma.CorrelationTemporal:
 		seen := map[int]bool{}
@@ -320,43 +361,60 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 				seen[idx] = true
 			}
 		}
-		return len(seen) == numRules
+		fired = len(seen) == numRules
 
 	case sigma.CorrelationTemporalOrdered:
-		// Greedily walk the events in arrival (time) order, advancing through the
+		// Greedily walk the events in chronological order, advancing through the
 		// required rule sequence as each next-needed rule is matched.
 		need := 0
 		for _, e := range g.events {
 			if e.rules[need] {
 				need++
 				if need == numRules {
-					return true
+					fired = true
+					break
 				}
 			}
 		}
-		return false
 	}
-	return false
+
+	if fired {
+		// Reset the bucket so one incident raises one alert: without this, every
+		// further in-window event re-fires the correlation (an alert flood), and a
+		// chained parent would count the same incident many times.
+		delete(s.groups, key)
+	}
+	return fired
 }
 
 func compareCount(count int, cond *sigma.CorrelationCondition) bool {
 	if cond == nil {
 		return false
 	}
-	switch cond.Op {
-	case "gt":
-		return count > cond.Count
-	case "gte":
-		return count >= cond.Count
-	case "lt":
-		return count < cond.Count
-	case "lte":
-		return count <= cond.Count
-	case "eq":
-		return count == cond.Count
-	case "neq":
-		return count != cond.Count
-	default:
-		return false
+	terms := cond.Terms
+	if len(terms) == 0 {
+		terms = []sigma.CorrelationConditionTerm{{Op: cond.Op, Count: cond.Count}}
 	}
+	// Multiple condition terms are linked with logical AND per the spec.
+	for _, term := range terms {
+		ok := false
+		switch term.Op {
+		case "gt":
+			ok = count > term.Count
+		case "gte":
+			ok = count >= term.Count
+		case "lt":
+			ok = count < term.Count
+		case "lte":
+			ok = count <= term.Count
+		case "eq":
+			ok = count == term.Count
+		case "neq":
+			ok = count != term.Count
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }

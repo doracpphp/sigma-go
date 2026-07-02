@@ -40,7 +40,12 @@ func (lim *Counter) IncrementN(now time.Time, n float64) float64 {
 	lim.curr.total += n
 
 	elapsed := now.Sub(lim.curr.Start())
-	weight := float64(lim.size-elapsed) / float64(lim.size) // TODO: this breaks if provided with a timestamp before the current window start
+	if elapsed < 0 {
+		// An out-of-order timestamp before the current window start would give a
+		// weight > 1 and inflate the count; clamp it to the window boundary.
+		elapsed = 0
+	}
+	weight := float64(lim.size-elapsed) / float64(lim.size)
 	return weight*lim.prev.total + lim.curr.total
 }
 

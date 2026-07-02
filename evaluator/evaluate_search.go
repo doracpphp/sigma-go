@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 func (rule RuleEvaluator) evaluateSearchExpression(search sigma.SearchExpr, searchResults func(string) bool) bool {
@@ -228,7 +229,7 @@ func allEventValues(event Event) []string {
 
 func keywordMatches(keyword, value string, caseSensitive bool) bool {
 	if strings.ContainsAny(keyword, "*?") {
-		re, err := keywordRegexp(keyword, caseSensitive)
+		re, err := keywordRegexpCached(keyword, caseSensitive)
 		if err != nil {
 			return false
 		}
@@ -238,6 +239,29 @@ func keywordMatches(keyword, value string, caseSensitive bool) bool {
 		return strings.Contains(value, keyword)
 	}
 	return strings.Contains(strings.ToLower(value), strings.ToLower(keyword))
+}
+
+// keywordRegexps caches compiled keyword patterns: keywordMatches runs once per
+// keyword per field value per event, and compiling dominates the match cost.
+// Keywords come from rules so the cardinality is bounded by the ruleset.
+var keywordRegexps sync.Map // map[keywordKey]*regexp.Regexp
+
+type keywordKey struct {
+	keyword       string
+	caseSensitive bool
+}
+
+func keywordRegexpCached(keyword string, caseSensitive bool) (*regexp.Regexp, error) {
+	key := keywordKey{keyword, caseSensitive}
+	if cached, ok := keywordRegexps.Load(key); ok {
+		return cached.(*regexp.Regexp), nil
+	}
+	re, err := keywordRegexp(keyword, caseSensitive)
+	if err != nil {
+		return nil, err
+	}
+	keywordRegexps.Store(key, re)
+	return re, nil
 }
 
 // keywordRegexp converts a keyword containing `*`/`?` wildcards into an unanchored
@@ -433,6 +457,11 @@ func (rule *RuleEvaluator) matcherMatchesExists(field string, matcherValues []st
 // resolveFieldRefValues implements the `fieldref` modifier: each matcher value is
 // the name of another field, which is resolved to that field's value(s) in the
 // event. Missing referenced fields contribute no values (so they don't match).
+//
+// The resolved values are event data, not rule patterns, so any `*`, `?` or `\`
+// they contain is escaped: pySigma compares fieldref values literally, and
+// without escaping an event field containing `*` would match everything (and
+// every distinct value would permanently grow the wildcard-matcher caches).
 func (rule *RuleEvaluator) resolveFieldRefValues(fieldNames []string, event Event) ([]string, error) {
 	var resolved []string
 	for _, name := range fieldNames {
@@ -444,7 +473,7 @@ func (rule *RuleEvaluator) resolveFieldRefValues(fieldNames []string, event Even
 			if v == nil {
 				continue
 			}
-			resolved = append(resolved, modifiers.CoerceString(v))
+			resolved = append(resolved, modifiers.EscapeValue(modifiers.CoerceString(v)))
 		}
 	}
 	return resolved, nil

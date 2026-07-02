@@ -283,6 +283,11 @@ func (d *distinctTracker) observe(now time.Time, value string) float64 {
 }
 
 func InMemory(timeframe time.Duration) []evaluator.Option {
+	if timeframe <= 0 {
+		// A zero/negative default window would make the sliding counters divide
+		// by zero for rules without their own `detection.timeframe`.
+		timeframe = time.Hour
+	}
 	i := &inMemory{
 		timeframe: timeframe,
 		counts:    map[string]*tracked[*slidingstatistics.Counter]{},
