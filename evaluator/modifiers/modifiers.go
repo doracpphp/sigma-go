@@ -18,6 +18,26 @@ import (
 )
 
 func GetComparator(field string, comparators map[string]Comparator, modifiers ...string) (ComparatorFunc, error) {
+	// The `re` comparator accepts regex flag sub-modifiers that immediately follow
+	// it. pySigma accepts both short (re|i, re|m, re|s) and long (re|ignorecase,
+	// re|multiline, re|dotall) forms; both are normalised to the single inline-flag
+	// character here. Pull them out into a flag string and drop them from the
+	// modifier list so the remaining `re` is treated as a normal trailing comparator.
+	// This runs on the original modifier list, before `cased` is stripped, so a flag
+	// separated from `re` (e.g. re|cased|i) is correctly rejected as an unknown
+	// modifier rather than silently accepted.
+	reFlags := ""
+	var withoutFlags []string
+	for _, modifier := range modifiers {
+		if flag, ok := reFlagChar(modifier); ok &&
+			len(withoutFlags) > 0 && withoutFlags[len(withoutFlags)-1] == "re" {
+			reFlags += flag
+			continue
+		}
+		withoutFlags = append(withoutFlags, modifier)
+	}
+	modifiers = withoutFlags
+
 	// `cased` forces case-sensitive matching for this field, overriding the
 	// evaluator-wide default. Pull it out before processing the remaining modifiers.
 	caseSensitive := false
@@ -31,30 +51,20 @@ func GetComparator(field string, comparators map[string]Comparator, modifiers ..
 	}
 	modifiers = filteredModifiers
 
-	// The `re` comparator accepts regex flag sub-modifiers that immediately follow
-	// it. pySigma accepts both short (re|i, re|m, re|s) and long (re|ignorecase,
-	// re|multiline, re|dotall) forms; both are normalised to the single inline-flag
-	// character here. Pull them out into a flag string and drop them from the
-	// modifier list so the remaining `re` is treated as a normal trailing comparator.
-	reFlags := ""
-	var withoutFlags []string
-	for _, modifier := range modifiers {
-		if flag, ok := reFlagChar(modifier); ok &&
-			len(withoutFlags) > 0 && withoutFlags[len(withoutFlags)-1] == "re" {
-			reFlags += flag
-			continue
-		}
-		withoutFlags = append(withoutFlags, modifier)
-	}
-	modifiers = withoutFlags
-
-	defaultComparator := Comparator(baseComparator{})
 	if caseSensitive {
 		comparators = ComparatorsCaseSensitive
-		defaultComparator = baseComparatorCased{}
 	} else if comparators == nil {
 		comparators = Comparators
 	}
+	// The evaluator-wide CaseSensitive option passes a case-sensitive comparator
+	// set; the default (equality) comparison must be case-sensitive then too, not
+	// just the explicit contains/startswith/endswith modifiers. The comparator set
+	// itself carries that fact (see DefaultCaseSensitive), which also covers
+	// wrapped comparators like the bundle's Aho-Corasick contains.
+	if c, ok := comparators["contains"].(CaseSensitivityHinter); ok && c.DefaultCaseSensitive() {
+		caseSensitive = true
+	}
+	defaultComparator := Comparator(baseComparator{cased: caseSensitive})
 
 	if len(modifiers) == 0 {
 		return defaultComparator.Matches, nil
@@ -162,6 +172,14 @@ type FieldComparator interface {
 	MatchesField(field string, actual any, expected any) (bool, error)
 }
 
+// CaseSensitivityHinter is an optional extension to Comparator implemented by
+// comparators that know whether their comparator set is case-sensitive.
+// GetComparator uses the hint (from the set's "contains" entry) to pick a
+// matching default (equality) comparator.
+type CaseSensitivityHinter interface {
+	DefaultCaseSensitive() bool
+}
+
 type ComparatorFunc func(actual, expected any) (bool, error)
 
 // ValueModifier modifies the expected value before it is passed to the comparator.
@@ -261,9 +279,9 @@ func expandCached(chain string, value any, modifiers []ValueModifier) ([]any, er
 }
 
 var Comparators = map[string]Comparator{
-	"contains":   contains{},
-	"endswith":   endswith{},
-	"startswith": startswith{},
+	"contains":   affixComparator{kind: affixContains},
+	"endswith":   affixComparator{kind: affixSuffix},
+	"startswith": affixComparator{kind: affixPrefix},
 	"re":         re{},
 	"cidr":       cidr{},
 	"gt":         gt{},
@@ -273,9 +291,9 @@ var Comparators = map[string]Comparator{
 }
 
 var ComparatorsCaseSensitive = map[string]Comparator{
-	"contains":   containsCS{},
-	"endswith":   endswithCS{},
-	"startswith": startswithCS{},
+	"contains":   affixComparator{kind: affixContains, cased: true},
+	"endswith":   affixComparator{kind: affixSuffix, cased: true},
+	"startswith": affixComparator{kind: affixPrefix, cased: true},
 	"re":         re{},
 	"cidr":       cidr{},
 	"gt":         gt{},
@@ -307,88 +325,67 @@ var EventValueModifiers = map[string]ValueModifier{
 	"year":   timestampModifier{tsYear},
 }
 
-type baseComparator struct{}
+// baseComparator implements the default (equality) comparison. Per the Sigma
+// spec it is case-insensitive unless cased is set, and unescaped `*`/`?` in
+// plain values are wildcards.
+type baseComparator struct{ cased bool }
 
-func (baseComparator) Matches(actual, expected any) (bool, error) {
-	switch {
-	case actual == nil:
+func (b baseComparator) Matches(actual, expected any) (bool, error) {
+	if actual == nil {
 		// special case: "null" should match the case where a field isn't present (and so actual is nil)
 		// A missing field matches nothing else (in particular not the `*` wildcard, which requires a value).
 		return expected == "null", nil
-	default:
-		// The Sigma spec defines that by default comparisons are case-insensitive
-		// and that unescaped `*`/`?` in plain values are wildcards
-		return matchWildcard(CoerceString(actual), CoerceString(expected), false), nil
 	}
+	return matchWildcard(CoerceString(actual), CoerceString(expected), b.cased), nil
 }
 
-// baseComparatorCased is the case-sensitive equivalent of baseComparator, used
-// for the default (equality) comparison when the `cased` modifier is present.
-type baseComparatorCased struct{}
-
-func (baseComparatorCased) Matches(actual, expected any) (bool, error) {
-	switch {
-	case actual == nil:
-		return expected == "null", nil
-	default:
-		return matchWildcard(CoerceString(actual), CoerceString(expected), true), nil
-	}
-}
-
-// The contains/startswith/endswith comparators add implicit wildcards around the
-// rule value (`*X*`, `X*`, `*X` respectively) and, like pySigma, honour any `*`/`?`
-// wildcards written inside X. When the value has no wildcards the fast,
-// allocation-free fold helpers are used; otherwise the value is matched through the
-// shared wildcard engine (anchored regex).
+// affixComparator implements contains/startswith/endswith (kind) in both the
+// case-insensitive (default) and case-sensitive (cased) variants. These add
+// implicit wildcards around the rule value (`*X*`, `X*`, `*X` respectively)
+// and, like pySigma, honour any `*`/`?` wildcards written inside X. When the
+// value has no wildcards the fast, allocation-free helpers are used; otherwise
+// the value is matched through the shared wildcard engine (anchored regex).
 //
 // A nil actual means the field is absent from the event. An absent field has no
 // value to contain/prefix/suffix, so it never matches (only the default comparator
 // treats nil specially, matching the `null` sentinel). Without this guard a
 // wildcard value like `contains: '*'` would match every event, since CoerceString
 // turns nil into the non-empty string "<nil>".
+type affixComparator struct {
+	kind  affixKind
+	cased bool
+}
 
-type contains struct{}
+func (c affixComparator) DefaultCaseSensitive() bool { return c.cased }
 
-func (contains) Matches(actual, expected any) (bool, error) {
+func (c affixComparator) Matches(actual, expected any) (bool, error) {
 	if actual == nil {
 		return false, nil
 	}
 	a, e := CoerceString(actual), CoerceString(expected)
 	if HasUnescapedWildcard(e) {
-		return matchAffix(a, e, affixContains, false), nil
+		return matchAffix(a, e, c.kind, c.cased), nil
 	}
-	// The Sigma spec defines that by default comparisons are case-insensitive.
 	// No unescaped wildcards: resolve escapes (\*, \?, \\) to their literal
-	// characters before the plain substring search.
-	return containsFold(a, UnescapeValue(e)), nil
-}
-
-type endswith struct{}
-
-func (endswith) Matches(actual, expected any) (bool, error) {
-	if actual == nil {
-		return false, nil
+	// characters before the plain substring/prefix/suffix comparison.
+	needle := UnescapeValue(e)
+	switch c.kind {
+	case affixPrefix:
+		if c.cased {
+			return strings.HasPrefix(a, needle), nil
+		}
+		return hasPrefixFold(a, needle), nil
+	case affixSuffix:
+		if c.cased {
+			return strings.HasSuffix(a, needle), nil
+		}
+		return hasSuffixFold(a, needle), nil
+	default:
+		if c.cased {
+			return strings.Contains(a, needle), nil
+		}
+		return containsFold(a, needle), nil
 	}
-	a, e := CoerceString(actual), CoerceString(expected)
-	if HasUnescapedWildcard(e) {
-		return matchAffix(a, e, affixSuffix, false), nil
-	}
-	// The Sigma spec defines that by default comparisons are case-insensitive
-	return hasSuffixFold(a, UnescapeValue(e)), nil
-}
-
-type startswith struct{}
-
-func (startswith) Matches(actual, expected any) (bool, error) {
-	if actual == nil {
-		return false, nil
-	}
-	a, e := CoerceString(actual), CoerceString(expected)
-	if HasUnescapedWildcard(e) {
-		return matchAffix(a, e, affixPrefix, false), nil
-	}
-	// The Sigma spec defines that by default comparisons are case-insensitive
-	return hasPrefixFold(a, UnescapeValue(e)), nil
 }
 
 // The case-insensitive comparators run once per rule value per event, so the
@@ -458,45 +455,6 @@ func hasSuffixFold(s, suffix string) bool {
 	return len(s) >= len(suffix) && equalFoldASCII(s[len(s)-len(suffix):], suffix)
 }
 
-type containsCS struct{}
-
-func (containsCS) Matches(actual, expected any) (bool, error) {
-	if actual == nil {
-		return false, nil
-	}
-	a, e := CoerceString(actual), CoerceString(expected)
-	if HasUnescapedWildcard(e) {
-		return matchAffix(a, e, affixContains, true), nil
-	}
-	return strings.Contains(a, UnescapeValue(e)), nil
-}
-
-type endswithCS struct{}
-
-func (endswithCS) Matches(actual, expected any) (bool, error) {
-	if actual == nil {
-		return false, nil
-	}
-	a, e := CoerceString(actual), CoerceString(expected)
-	if HasUnescapedWildcard(e) {
-		return matchAffix(a, e, affixSuffix, true), nil
-	}
-	return strings.HasSuffix(a, UnescapeValue(e)), nil
-}
-
-type startswithCS struct{}
-
-func (startswithCS) Matches(actual, expected any) (bool, error) {
-	if actual == nil {
-		return false, nil
-	}
-	a, e := CoerceString(actual), CoerceString(expected)
-	if HasUnescapedWildcard(e) {
-		return matchAffix(a, e, affixPrefix, true), nil
-	}
-	return strings.HasPrefix(a, UnescapeValue(e)), nil
-}
-
 type b64 struct{}
 
 func (b64) Modify(value any) (any, error) {
@@ -564,12 +522,15 @@ func (b base64offset) Modify(value any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(expanded) == 0 {
+		return nil, fmt.Errorf("base64offset: value %q is too short to produce an offset encoding", CoerceString(value))
+	}
 	return expanded[0], nil
 }
 
 func (base64offset) ModifyMulti(value any) ([]any, error) {
 	raw := []byte(CoerceString(value))
-	out := make([]any, 3)
+	out := make([]any, 0, 3)
 	for i := 0; i < 3; i++ {
 		prefixed := append(bytes.Repeat([]byte{' '}, i), raw...)
 		encoded := base64.StdEncoding.EncodeToString(prefixed)
@@ -586,7 +547,13 @@ func (base64offset) ModifyMulti(value any) ([]any, error) {
 		} else {
 			encoded = ""
 		}
-		out[i] = encoded
+		// A 1-byte value has no alignment-specific encoding at some offsets (the
+		// start/end trims consume the whole group). Drop those candidates: an
+		// empty string fed into `contains` would match every event.
+		if encoded == "" {
+			continue
+		}
+		out = append(out, encoded)
 	}
 	return out, nil
 }
@@ -614,12 +581,12 @@ var windashTrigger = regexp.MustCompile(`\B[-/]\b`)
 // pathological rule values and truncates extra dash positions if exceeded.
 const windashMaxPositions = 6
 
-func (w windash) Modify(value any) (any, error) {
-	expanded, err := w.ModifyMulti(value)
-	if err != nil {
-		return nil, err
-	}
-	return expanded[0], nil
+// Modify implements the single-value ValueModifier interface. The original
+// value is itself one of the windash variants (`-` and `/` are both in
+// windashChars), so it is returned unchanged rather than silently rewritten to
+// an arbitrary variant; use ModifyMulti to get the full expansion.
+func (windash) Modify(value any) (any, error) {
+	return value, nil
 }
 
 func (windash) ModifyMulti(value any) ([]any, error) {
@@ -678,21 +645,38 @@ type re struct {
 	flags string
 }
 
-// compiledRegexps caches compiled patterns: Matches is called once per event so
-// compiling inline would dominate evaluation cost. Patterns come from rules so
-// the cardinality is bounded by the loaded ruleset.
-var compiledRegexps sync.Map // map[string]*regexp.Regexp
+// compiledRegexps caches compilation results (including failures, so an invalid
+// rule pattern isn't recompiled for every event): Matches is called once per
+// event so compiling inline would dominate evaluation cost. Patterns come from
+// rules so the cardinality is bounded by the loaded ruleset.
+var compiledRegexps sync.Map // map[regexKey]regexCacheEntry
+
+type regexKey struct{ flags, pattern string }
+
+type regexCacheEntry struct {
+	re  *regexp.Regexp
+	err error
+}
 
 func CompileRegex(pattern string) (*regexp.Regexp, error) {
-	if cached, ok := compiledRegexps.Load(pattern); ok {
-		return cached.(*regexp.Regexp), nil
+	return compileRegexWithFlags("", pattern)
+}
+
+// compileRegexWithFlags caches on (flags, pattern) so callers don't have to
+// build the "(?flags)pattern" string on every event just to hit the cache.
+func compileRegexWithFlags(flags, pattern string) (*regexp.Regexp, error) {
+	key := regexKey{flags, pattern}
+	if cached, ok := compiledRegexps.Load(key); ok {
+		entry := cached.(regexCacheEntry)
+		return entry.re, entry.err
 	}
-	compiled, err := regexp.Compile(pattern)
-	if err != nil {
-		return nil, err
+	full := pattern
+	if flags != "" {
+		full = "(?" + flags + ")" + pattern
 	}
-	compiledRegexps.Store(pattern, compiled)
-	return compiled, nil
+	compiled, err := regexp.Compile(full)
+	compiledRegexps.LoadOrStore(key, regexCacheEntry{re: compiled, err: err})
+	return compiled, err
 }
 
 func (r re) Matches(actual any, expected any) (bool, error) {
@@ -701,11 +685,7 @@ func (r re) Matches(actual any, expected any) (bool, error) {
 		// the bundle's regex path, which both reject a nil/absent field).
 		return false, nil
 	}
-	pattern := CoerceString(expected)
-	if r.flags != "" {
-		pattern = "(?" + r.flags + ")" + pattern
-	}
-	compiled, err := CompileRegex(pattern)
+	compiled, err := compileRegexWithFlags(r.flags, CoerceString(expected))
 	if err != nil {
 		return false, err
 	}
@@ -873,8 +853,12 @@ func coerceNumeric(left, right interface{}) (interface{}, interface{}, error) {
 		if err := yaml.Unmarshal([]byte(left.(string)), &leftParsed); err != nil {
 			return nil, nil, err
 		}
-		//Check the parsed type is the correct one, otherwise we get a stack overflow
-		if reflect.TypeOf(leftParsed).Kind() != reflect.Float64 && reflect.TypeOf(leftParsed).Kind() != reflect.Int {
+		// Only recurse when the string parsed to a number, otherwise we'd loop
+		// forever. A type switch also guards nil (from "", "~", "null"), which
+		// reflect.TypeOf(...).Kind() would panic on.
+		switch leftParsed.(type) {
+		case int, float64:
+		default:
 			return nil, nil, fmt.Errorf("cannot coerce %T and %T to numeric", left, right)
 		}
 		return coerceNumeric(leftParsed, right)
@@ -883,8 +867,9 @@ func coerceNumeric(left, right interface{}) (interface{}, interface{}, error) {
 		if err := yaml.Unmarshal([]byte(right.(string)), &rightParsed); err != nil {
 			return nil, nil, err
 		}
-		//Check the parsed type is the correct one, otherwise we get a stack overflow
-		if reflect.TypeOf(rightParsed).Kind() != reflect.Float64 && reflect.TypeOf(rightParsed).Kind() != reflect.Int {
+		switch rightParsed.(type) {
+		case int, float64:
+		default:
 			return nil, nil, fmt.Errorf("cannot coerce %T and %T to numeric", left, right)
 		}
 		return coerceNumeric(left, rightParsed)

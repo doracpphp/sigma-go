@@ -101,16 +101,12 @@ func ruleChannels(ls sigma.Logsource) []string {
 	return nil
 }
 
-// ruleAppliesToChannel reports whether a rule with the given logsource should be
-// evaluated against an event from eventChannel. It returns true (don't filter)
-// when the filter is disabled, the rule has no known channel, or the event has no
-// channel; it only excludes a rule when the channel is known and doesn't match.
-func ruleAppliesToChannel(ls sigma.Logsource, eventChannel string) bool {
-	if !channelFilterEnabled || eventChannel == "" {
-		return true
-	}
-	chans := ruleChannels(ls)
-	if len(chans) == 0 {
+// channelApplies reports whether rules restricted to chans should be evaluated
+// against an event from eventChannel. It returns true (don't filter) when the
+// filter is disabled, there is no channel restriction, or the event has no
+// channel; it only excludes when the restriction is known and doesn't match.
+func channelApplies(chans []string, eventChannel string) bool {
+	if !channelFilterEnabled || eventChannel == "" || len(chans) == 0 {
 		return true
 	}
 	for _, c := range chans {
@@ -119,4 +115,69 @@ func ruleAppliesToChannel(ls sigma.Logsource, eventChannel string) bool {
 		}
 	}
 	return false
+}
+
+// ruleAppliesToChannel reports whether a rule with the given logsource should be
+// evaluated against an event from eventChannel.
+func ruleAppliesToChannel(ls sigma.Logsource, eventChannel string) bool {
+	return channelApplies(ruleChannels(ls), eventChannel)
+}
+
+// correlationChannels returns the channels an event must come from to be
+// relevant to the given correlation rule: the union of the channels of every
+// rule it references, transitively through chained correlations. It returns
+// nil (no restriction) if any referenced rule is unrestricted or can't be
+// resolved, so filtering stays conservative.
+func correlationChannels(rule sigma.Rule, all []sigma.Rule) []string {
+	lookup := map[string]sigma.Rule{}
+	for _, r := range all {
+		if r.Name != "" {
+			lookup[r.Name] = r
+		}
+		if r.ID != "" {
+			lookup[r.ID] = r
+		}
+	}
+
+	var union []string
+	unrestricted := false
+	seen := map[string]bool{}
+	var visit func(r sigma.Rule)
+	visit = func(r sigma.Rule) {
+		key := r.Name + "\x00" + r.ID
+		if seen[key] || unrestricted {
+			return
+		}
+		seen[key] = true
+		if r.Correlation == nil {
+			chans := ruleChannels(r.Logsource)
+			if len(chans) == 0 {
+				unrestricted = true
+				return
+			}
+		next:
+			for _, c := range chans {
+				for _, u := range union {
+					if strings.EqualFold(u, c) {
+						continue next
+					}
+				}
+				union = append(union, c)
+			}
+			return
+		}
+		for _, ref := range r.Correlation.Rules {
+			referenced, ok := lookup[ref]
+			if !ok {
+				unrestricted = true
+				return
+			}
+			visit(referenced)
+		}
+	}
+	visit(rule)
+	if unrestricted {
+		return nil
+	}
+	return union
 }

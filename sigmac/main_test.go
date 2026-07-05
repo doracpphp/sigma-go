@@ -110,13 +110,23 @@ func TestEventTimestamp(t *testing.T) {
 }
 
 func TestSplitYAMLDocs(t *testing.T) {
-	docs := splitYAMLDocs([]byte("title: a\n---\ntitle: b\n"))
-	if len(docs) != 2 {
-		t.Fatalf("expected 2 documents, got %d", len(docs))
+	docs, err := splitYAMLDocs([]byte("title: a\n---\ntitle: b\n"))
+	if err != nil || len(docs) != 2 {
+		t.Fatalf("expected 2 documents, got %d (err=%v)", len(docs), err)
 	}
 	// A `---` inside a value (not on its own line) must not split.
-	docs = splitYAMLDocs([]byte("title: a---b\n"))
-	if len(docs) != 1 {
-		t.Fatalf("expected 1 document, got %d", len(docs))
+	docs, err = splitYAMLDocs([]byte("title: a---b\n"))
+	if err != nil || len(docs) != 1 {
+		t.Fatalf("expected 1 document, got %d (err=%v)", len(docs), err)
+	}
+}
+
+// Files saved with Windows line endings must still be split into documents; a
+// line-based splitter that doesn't account for the \r drops every rule after
+// the first separator.
+func TestSplitYAMLDocsCRLF(t *testing.T) {
+	docs, err := splitYAMLDocs([]byte("title: a\r\n---\r\ntitle: b\r\n"))
+	if err != nil || len(docs) != 2 {
+		t.Fatalf("expected 2 documents, got %d (err=%v)", len(docs), err)
 	}
 }

@@ -368,7 +368,7 @@ correlation:
 	// rule_a's is chronologically second (t+2s) but arrives first.
 	// True order is A(t+2) after B(t+1)? No: B at t+1 precedes A at t+2, so "A then B" must NOT fire.
 	c := buildCorrelation(t, corr, ruleA, ruleB)
-	c.matches(ctx, map[string]interface{}{"EventID": 1, "Host": "h1"}, base.Add(2*time.Second)) // A at t+2
+	c.matches(ctx, map[string]interface{}{"EventID": 1, "Host": "h1"}, base.Add(2*time.Second))         // A at t+2
 	res, _ := c.matches(ctx, map[string]interface{}{"EventID": 2, "Host": "h1"}, base.Add(time.Second)) // B at t+1 (late arrival)
 	if res.Match {
 		t.Fatal("chronologically B precedes A, so 'A then B' must not fire")
@@ -376,7 +376,7 @@ correlation:
 
 	// The reverse: A arrives late but is chronologically first -> fires.
 	c2 := buildCorrelation(t, corr, ruleA, ruleB)
-	c2.matches(ctx, map[string]interface{}{"EventID": 2, "Host": "h2"}, base.Add(2*time.Second)) // B at t+2
+	c2.matches(ctx, map[string]interface{}{"EventID": 2, "Host": "h2"}, base.Add(2*time.Second))        // B at t+2
 	res, _ = c2.matches(ctx, map[string]interface{}{"EventID": 1, "Host": "h2"}, base.Add(time.Second)) // A at t+1 (late arrival)
 	if !res.Match {
 		t.Fatal("chronologically A precedes B, so 'A then B' should fire despite arrival order")

@@ -2,13 +2,16 @@ package evaluator
 
 import (
 	"context"
-	aho_corasick "github.com/BobuSumisu/aho-corasick"
-	"github.com/doracpphp/sigma-go"
-	"github.com/doracpphp/sigma-go/evaluator/modifiers"
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
 	"unsafe"
+
+	aho_corasick "github.com/BobuSumisu/aho-corasick"
+	"github.com/doracpphp/sigma-go"
+	"github.com/doracpphp/sigma-go/evaluator/modifiers"
 )
 
 // ForRules compiles a set of rule evaluators which are evaluated together allowing for use of
@@ -119,10 +122,13 @@ type ahocorasickSearcher struct {
 // resultsKey identifies one cached trie scan: the field, the identity of the
 // scanned string and whether the scan was case-sensitive. Case sensitivity must
 // be part of the key because a case-insensitive scan lowercases the haystack
-// and therefore produces a different match set than a case-sensitive one.
+// and therefore produces a different match set than a case-sensitive one. The
+// length is included because two different strings can share a data pointer
+// (one being a prefix slice of the other); pointer+length pins the exact string.
 type resultsKey struct {
 	field         string
 	data          *byte
+	length        int
 	caseSensitive bool
 }
 
@@ -131,7 +137,7 @@ func (a *ahocorasickContains) getResults(field, s string, caseSensitive bool) ma
 	if !ok || as.Trie == nil {
 		return nil
 	}
-	key := resultsKey{field, unsafe.StringData(s), caseSensitive} // using the underlying []byte pointer means we only compute results once per interned string
+	key := resultsKey{field, unsafe.StringData(s), len(s), caseSensitive} // using the underlying []byte pointer means we only compute results once per interned string
 	if result, ok := a.results[key]; ok {
 		return result
 	}
@@ -188,7 +194,7 @@ func (bundle RuleEvaluatorBundle) Matches(ctx context.Context, event Event) ([]R
 	for _, rule := range bundle.evaluators {
 		result, err := rule.matches(ctx, event, comparators)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("rule %q: %w", rule.Title, err))
 			continue
 		}
 		ruleresults = append(ruleresults, RuleResult{
@@ -196,7 +202,9 @@ func (bundle RuleEvaluatorBundle) Matches(ctx context.Context, event Event) ([]R
 			Rule:   rule.Rule,
 		})
 	}
-	return ruleresults, nil
+	// The results of the healthy rules are returned alongside the error, so one
+	// broken rule doesn't stop the rest of the bundle from being useful.
+	return ruleresults, errors.Join(errs...)
 }
 
 type ahocorasickContains struct {
@@ -205,6 +213,11 @@ type ahocorasickContains struct {
 	matchers map[string]ahocorasickSearcher
 	results  map[resultsKey]map[string]bool
 }
+
+// DefaultCaseSensitive tells modifiers.GetComparator whether this comparator
+// set is the case-sensitive one, so the default (equality) comparison matches
+// the bundle's case sensitivity.
+func (a *ahocorasickContains) DefaultCaseSensitive() bool { return a.caseSensitive }
 
 func (a *ahocorasickContains) MatchesField(field string, actual any, expected any) (bool, error) {
 	if actual == nil {

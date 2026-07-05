@@ -82,19 +82,19 @@ func TestAffixComparatorsWildcards(t *testing.T) {
 		expected string
 		want     bool
 	}{
-		{"contains plain match", contains{}, "x foobar y", "oba", true},
-		{"contains star match", contains{}, "alpha-foo-bar-beta", "foo*bar", true},
-		{"contains star no match", contains{}, "alpha-foo-baz", "foo*bar", false},
-		{"contains question match", contains{}, "a-fXo-b", "fXo", true},
-		{"contains question wildcard", contains{}, "a-fXo-b", "f?o", true},
-		{"contains escaped star not wildcard", contains{}, "a fooXbar b", `foo\*bar`, false}, // \* is not a wildcard
-		{"startswith wildcard match", startswith{}, "fooXXbar tail", "foo*bar", true},
-		{"startswith wildcard anchored", startswith{}, "pre foo bar", "foo*bar", false},
-		{"endswith wildcard match", endswith{}, "head fooZZbar", "foo*bar", true},
-		{"endswith wildcard anchored", endswith{}, "fooZZbar tail", "foo*bar", false},
-		{"contains CS star is wildcard", containsCS{}, "x FooXBar y", "Foo*Bar", true},
-		{"contains CS wildcard match", containsCS{}, "x FooMidBar y", "Foo*Bar", true},
-		{"contains CS wildcard case", containsCS{}, "x fooMidbar y", "Foo*Bar", false},
+		{"contains plain match", affixComparator{kind: affixContains}, "x foobar y", "oba", true},
+		{"contains star match", affixComparator{kind: affixContains}, "alpha-foo-bar-beta", "foo*bar", true},
+		{"contains star no match", affixComparator{kind: affixContains}, "alpha-foo-baz", "foo*bar", false},
+		{"contains question match", affixComparator{kind: affixContains}, "a-fXo-b", "fXo", true},
+		{"contains question wildcard", affixComparator{kind: affixContains}, "a-fXo-b", "f?o", true},
+		{"contains escaped star not wildcard", affixComparator{kind: affixContains}, "a fooXbar b", `foo\*bar`, false}, // \* is not a wildcard
+		{"startswith wildcard match", affixComparator{kind: affixPrefix}, "fooXXbar tail", "foo*bar", true},
+		{"startswith wildcard anchored", affixComparator{kind: affixPrefix}, "pre foo bar", "foo*bar", false},
+		{"endswith wildcard match", affixComparator{kind: affixSuffix}, "head fooZZbar", "foo*bar", true},
+		{"endswith wildcard anchored", affixComparator{kind: affixSuffix}, "fooZZbar tail", "foo*bar", false},
+		{"contains CS star is wildcard", affixComparator{kind: affixContains, cased: true}, "x FooXBar y", "Foo*Bar", true},
+		{"contains CS wildcard match", affixComparator{kind: affixContains, cased: true}, "x FooMidBar y", "Foo*Bar", true},
+		{"contains CS wildcard case", affixComparator{kind: affixContains, cased: true}, "x fooMidbar y", "Foo*Bar", false},
 	}
 	for _, tt := range tests {
 		got, err := tt.cmp.Matches(tt.actual, tt.expected)

@@ -325,7 +325,7 @@ func BenchmarkContains(b *testing.B) {
 	haystackString := string(haystack)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := contains{}.Matches(string(haystackString), needle)
+		_, err := affixComparator{kind: affixContains}.Matches(string(haystackString), needle)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -343,7 +343,7 @@ func BenchmarkContainsCS(b *testing.B) {
 	haystackString := string(haystack)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := containsCS{}.Matches(string(haystackString), needle)
+		_, err := affixComparator{kind: affixContains, cased: true}.Matches(string(haystackString), needle)
 		if err != nil {
 			b.Fatal(err)
 		}
