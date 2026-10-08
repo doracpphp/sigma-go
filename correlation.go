@@ -14,6 +14,8 @@ const (
 	CorrelationValueCount      = "value_count"
 	CorrelationTemporal        = "temporal"
 	CorrelationTemporalOrdered = "temporal_ordered"
+	CorrelationValueSum        = "value_sum"
+	CorrelationValueAvg        = "value_avg"
 )
 
 // Correlation describes a Sigma correlation rule: a meta-rule that aggregates the
@@ -21,7 +23,8 @@ const (
 //
 // See https://github.com/SigmaHQ/sigma-specification (Sigma Correlation Rules).
 type Correlation struct {
-	// Type is one of event_count, value_count, temporal, temporal_ordered.
+	// Type is one of event_count, value_count, temporal, temporal_ordered,
+	// value_sum or value_avg.
 	Type string `yaml:",omitempty" json:",omitempty"`
 
 	// Rules references the correlated rules by their `name` or `id`.
@@ -47,8 +50,9 @@ type Correlation struct {
 	Generate bool `yaml:",omitempty" json:",omitempty"`
 }
 
-// CorrelationCondition is the threshold comparison for event_count / value_count
-// correlation rules, e.g. `{gte: 10}` or, for value_count, `{gte: 100, field: User}`.
+// CorrelationCondition is the threshold comparison for event_count, value_count,
+// value_sum and value_avg correlation rules, e.g. `{gte: 10}` or, for the
+// field-based types, `{gte: 100, field: User}`.
 // Multiple operators (e.g. `{gte: 10, lte: 20}`) are linked with logical AND, per
 // the Sigma correlation specification.
 type CorrelationCondition struct {
@@ -58,7 +62,8 @@ type CorrelationCondition struct {
 	Count int
 	// Terms holds every operator in the condition; all of them must hold (AND).
 	Terms []CorrelationConditionTerm
-	// Field is the field whose distinct values are counted (value_count only).
+	// Field is the field whose distinct values are counted (value_count), or
+	// whose numeric values are summed (value_sum) or averaged (value_avg).
 	Field string
 }
 
@@ -67,6 +72,18 @@ type CorrelationCondition struct {
 type CorrelationConditionTerm struct {
 	Op    string
 	Count int
+	// Threshold is set only for a fractional threshold (e.g. a value_avg limit
+	// of 2.5), with Count holding it truncated to an integer. When Threshold is
+	// zero, Count is the threshold. Use Value to read the effective threshold.
+	Threshold float64
+}
+
+// Value returns the term's threshold.
+func (t CorrelationConditionTerm) Value() float64 {
+	if t.Threshold != 0 {
+		return t.Threshold
+	}
+	return float64(t.Count)
 }
 
 // Timespan is a Sigma correlation timespan such as `30s`, `5m`, `2h`, `7d`.
@@ -199,11 +216,15 @@ func (c *CorrelationCondition) unmarshal(node *yaml.Node) error {
 		case "gt", "gte", "lt", "lte", "eq", "neq":
 			// Multiple operators are allowed and linked with logical AND
 			// (e.g. {gte: 10, lte: 20} means "between 10 and 20").
-			var count int
-			if err := value.Decode(&count); err != nil {
+			var threshold float64
+			if err := value.Decode(&threshold); err != nil {
 				return err
 			}
-			c.Terms = append(c.Terms, CorrelationConditionTerm{Op: key.Value, Count: count})
+			term := CorrelationConditionTerm{Op: key.Value, Count: int(threshold)}
+			if threshold != float64(term.Count) {
+				term.Threshold = threshold
+			}
+			c.Terms = append(c.Terms, term)
 		default:
 			return fmt.Errorf("unknown correlation condition key %q", key.Value)
 		}
@@ -237,7 +258,12 @@ func (c CorrelationCondition) MarshalYAML() (interface{}, error) {
 		terms = []CorrelationConditionTerm{{Op: c.Op, Count: c.Count}}
 	}
 	for _, term := range terms {
-		if err := appendPair(term.Op, term.Count); err != nil {
+		v := term.Value()
+		var threshold interface{} = v
+		if v == float64(int(v)) {
+			threshold = int(v)
+		}
+		if err := appendPair(term.Op, threshold); err != nil {
 			return nil, err
 		}
 	}

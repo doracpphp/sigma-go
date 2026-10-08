@@ -4,9 +4,11 @@ import (
 	"strings"
 
 	"github.com/doracpphp/sigma-go"
+	"github.com/doracpphp/sigma-go/evaluator"
 )
 
-// channelFilterEnabled gates the channel filter; set from the -channel-filter flag.
+// channelFilterEnabled gates the logsource filter (channel, event ID and
+// product scoping); set from the -channel-filter flag.
 var channelFilterEnabled = true
 
 // serviceChannels maps a Sigma Windows logsource `service` to the evtx Channel(s)
@@ -47,80 +49,188 @@ var serviceChannels = map[string][]string{
 	},
 }
 
-// categoryChannels maps a Sigma Windows logsource `category` to its evtx
-// Channel(s). Most categories are Sysmon-only; process_creation also covers
-// Security 4688. Categories not listed impose no channel restriction.
-var categoryChannels = map[string][]string{
-	"process_creation":          {"Microsoft-Windows-Sysmon/Operational", "Security"},
-	"network_connection":        {"Microsoft-Windows-Sysmon/Operational"},
-	"image_load":                {"Microsoft-Windows-Sysmon/Operational"},
-	"file_event":                {"Microsoft-Windows-Sysmon/Operational"},
-	"file_change":               {"Microsoft-Windows-Sysmon/Operational"},
-	"file_delete":               {"Microsoft-Windows-Sysmon/Operational"},
-	"file_rename":               {"Microsoft-Windows-Sysmon/Operational"},
-	"file_block":                {"Microsoft-Windows-Sysmon/Operational"},
-	"file_executable_detected":  {"Microsoft-Windows-Sysmon/Operational"},
-	"registry_event":            {"Microsoft-Windows-Sysmon/Operational"},
-	"registry_add":              {"Microsoft-Windows-Sysmon/Operational"},
-	"registry_delete":           {"Microsoft-Windows-Sysmon/Operational"},
-	"registry_set":              {"Microsoft-Windows-Sysmon/Operational"},
-	"registry_rename":           {"Microsoft-Windows-Sysmon/Operational"},
-	"process_access":            {"Microsoft-Windows-Sysmon/Operational"},
-	"dns_query":                 {"Microsoft-Windows-Sysmon/Operational"},
-	"pipe_created":              {"Microsoft-Windows-Sysmon/Operational"},
-	"wmi_event":                 {"Microsoft-Windows-Sysmon/Operational"},
-	"driver_load":               {"Microsoft-Windows-Sysmon/Operational"},
-	"create_remote_thread":      {"Microsoft-Windows-Sysmon/Operational"},
-	"raw_access_thread":         {"Microsoft-Windows-Sysmon/Operational"},
-	"create_stream_hash":        {"Microsoft-Windows-Sysmon/Operational"},
-	"clipboard_capture":         {"Microsoft-Windows-Sysmon/Operational"},
-	"process_tampering":         {"Microsoft-Windows-Sysmon/Operational"},
-	"sysmon_status":             {"Microsoft-Windows-Sysmon/Operational"},
-	"sysmon_error":              {"Microsoft-Windows-Sysmon/Operational"},
-	"ps_script":                 {"Microsoft-Windows-PowerShell/Operational"},
-	"ps_module":                 {"Microsoft-Windows-PowerShell/Operational"},
-	"ps_classic_start":          {"Windows PowerShell"},
-	"ps_classic_provider_start": {"Windows PowerShell"},
-	"ps_classic_script":         {"Windows PowerShell"},
+// logScope is one evtx channel a rule applies to, optionally narrowed to a set
+// of event IDs (nil = every event in the channel).
+type logScope struct {
+	channel  string
+	eventIDs []string
 }
 
-// ruleChannels returns the evtx channels a rule's logsource targets, or nil if the
-// logsource imposes no known channel restriction (in which case the rule applies
-// to events from any channel). `service` is more specific than `category`.
-func ruleChannels(ls sigma.Logsource) []string {
+const sysmonChannel = "Microsoft-Windows-Sysmon/Operational"
+
+func sysmon(eventIDs ...string) []logScope {
+	return []logScope{{channel: sysmonChannel, eventIDs: eventIDs}}
+}
+
+// categoryScopes maps a Sigma Windows logsource `category` to the evtx
+// channel(s) and event ID(s) that produce it. The event IDs matter as much as
+// the channel: Sysmon writes every category to one channel, and without them a
+// process_creation rule (say `Image|endswith: '\cmd.exe'`) would also fire on
+// network connections, image loads and file events of that process. The Sysmon
+// IDs follow pySigma's sysmon pipeline; process_creation also covers Security
+// 4688. Categories not listed impose no restriction.
+var categoryScopes = map[string][]logScope{
+	"process_creation": {
+		{channel: sysmonChannel, eventIDs: []string{"1"}},
+		{channel: "Security", eventIDs: []string{"4688"}},
+	},
+	"file_change":              sysmon("2"),
+	"network_connection":       sysmon("3"),
+	"sysmon_status":            sysmon("4", "16"),
+	"process_termination":      sysmon("5"),
+	"driver_load":              sysmon("6"),
+	"image_load":               sysmon("7"),
+	"create_remote_thread":     sysmon("8"),
+	"raw_access_thread":        sysmon("9"),
+	"process_access":           sysmon("10"),
+	"file_event":               sysmon("11"),
+	"registry_add":             sysmon("12"),
+	"registry_delete":          sysmon("12"),
+	"registry_set":             sysmon("13"),
+	"registry_rename":          sysmon("14"),
+	"registry_event":           sysmon("12", "13", "14"),
+	"create_stream_hash":       sysmon("15"),
+	"pipe_created":             sysmon("17", "18"),
+	"wmi_event":                sysmon("19", "20", "21"),
+	"dns_query":                sysmon("22"),
+	"file_delete":              sysmon("23", "26"),
+	"clipboard_capture":        sysmon("24"),
+	"process_tampering":        sysmon("25"),
+	"file_delete_detected":     sysmon("26"),
+	"file_block_executable":    sysmon("27"),
+	"file_block_shredding":     sysmon("28"),
+	"file_executable_detected": sysmon("29"),
+	"file_block":               sysmon("27", "28"),
+	"sysmon_error":             sysmon("255"),
+	// PowerShell 7 logs script blocks / module logging to its own channel with the
+	// same event IDs.
+	"ps_script": {
+		{channel: "Microsoft-Windows-PowerShell/Operational", eventIDs: []string{"4104"}},
+		{channel: "PowerShellCore/Operational", eventIDs: []string{"4104"}},
+	},
+	"ps_module": {
+		{channel: "Microsoft-Windows-PowerShell/Operational", eventIDs: []string{"4103"}},
+		{channel: "PowerShellCore/Operational", eventIDs: []string{"4103"}},
+	},
+	"ps_classic_start":          {{channel: "Windows PowerShell", eventIDs: []string{"400"}}},
+	"ps_classic_provider_start": {{channel: "Windows PowerShell", eventIDs: []string{"600"}}},
+	"ps_classic_script":         {{channel: "Windows PowerShell", eventIDs: []string{"800"}}},
+}
+
+// ruleScopes returns the channels (and event IDs) a rule's logsource targets,
+// or nil if the logsource imposes no known restriction (in which case the rule
+// applies to every event). `service` is more specific than `category`.
+func ruleScopes(ls sigma.Logsource) []logScope {
 	if ls.Service != "" {
 		if chans, ok := serviceChannels[strings.ToLower(ls.Service)]; ok {
-			return chans
+			scopes := make([]logScope, len(chans))
+			for i, c := range chans {
+				scopes[i] = logScope{channel: c}
+			}
+			return scopes
 		}
 	}
 	if ls.Category != "" {
-		if chans, ok := categoryChannels[strings.ToLower(ls.Category)]; ok {
-			return chans
+		if scopes, ok := categoryScopes[strings.ToLower(ls.Category)]; ok {
+			return scopes
 		}
 	}
 	return nil
 }
 
-// channelApplies reports whether rules restricted to chans should be evaluated
-// against an event from eventChannel. It returns true (don't filter) when the
-// filter is disabled, there is no channel restriction, or the event has no
-// channel; it only excludes when the restriction is known and doesn't match.
-func channelApplies(chans []string, eventChannel string) bool {
-	if !channelFilterEnabled || eventChannel == "" || len(chans) == 0 {
+// ruleChannels returns just the channel names of ruleScopes.
+func ruleChannels(ls sigma.Logsource) []string {
+	scopes := ruleScopes(ls)
+	if scopes == nil {
+		return nil
+	}
+	var chans []string
+	for _, s := range scopes {
+		if !containsFold(chans, s.channel) {
+			chans = append(chans, s.channel)
+		}
+	}
+	return chans
+}
+
+// scopeKey identifies a scope set, for grouping rules that share one.
+func scopeKey(scopes []logScope) string {
+	var b strings.Builder
+	for _, s := range scopes {
+		b.WriteString(strings.ToLower(s.channel))
+		b.WriteByte(0)
+		b.WriteString(strings.Join(s.eventIDs, ","))
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// scopeApplies reports whether rules restricted to scopes should be evaluated
+// against an event from eventChannel with eventID. It returns true (don't
+// filter) when the filter is disabled or there is no restriction, and treats a
+// missing channel or event ID as unknown rather than as a mismatch; it only
+// excludes when the restriction is known and doesn't match.
+func scopeApplies(scopes []logScope, eventChannel, eventID string) bool {
+	if !channelFilterEnabled || eventChannel == "" || len(scopes) == 0 {
 		return true
 	}
-	for _, c := range chans {
-		if strings.EqualFold(c, eventChannel) {
+	for _, s := range scopes {
+		if !strings.EqualFold(s.channel, eventChannel) {
+			continue
+		}
+		if len(s.eventIDs) == 0 || eventID == "" {
 			return true
+		}
+		for _, id := range s.eventIDs {
+			if id == eventID {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// ruleAppliesToChannel reports whether a rule with the given logsource should be
-// evaluated against an event from eventChannel.
-func ruleAppliesToChannel(ls sigma.Logsource, eventChannel string) bool {
-	return channelApplies(ruleChannels(ls), eventChannel)
+// channelApplies is scopeApplies for a bare channel list (no event IDs).
+func channelApplies(chans []string, eventChannel string) bool {
+	scopes := make([]logScope, len(chans))
+	for i, c := range chans {
+		scopes[i] = logScope{channel: c}
+	}
+	return scopeApplies(scopes, eventChannel, "")
+}
+
+// ruleAppliesToEvent reports whether a rule with the given logsource should be
+// evaluated against an event from eventChannel with eventID.
+func ruleAppliesToEvent(ls sigma.Logsource, eventChannel, eventID string) bool {
+	return scopeApplies(ruleScopes(ls), eventChannel, eventID)
+}
+
+// logsourceFilter is the evaluator.WithEventFilter used for the rules a
+// correlation evaluates internally, so they get the same channel/event ID
+// scoping as the bundled detection rules.
+func logsourceFilter(rule sigma.Rule, event evaluator.Event) bool {
+	m, ok := event.(map[string]interface{})
+	if !ok {
+		return true
+	}
+	return ruleAppliesToEvent(rule.Logsource, field(m, "Channel"), field(m, "EventID"))
+}
+
+// targetsWindows reports whether a rule can apply to Windows event logs: its
+// logsource product is windows or unset. Rules for other products (linux,
+// macos, cloud, ...) reuse field names such as Image and CommandLine, so
+// evaluating them against evtx events only produces false positives.
+func targetsWindows(ls sigma.Logsource) bool {
+	return ls.Product == "" || strings.EqualFold(ls.Product, "windows")
+}
+
+func containsFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // correlationChannels returns the channels an event must come from to be
@@ -155,14 +265,10 @@ func correlationChannels(rule sigma.Rule, all []sigma.Rule) []string {
 				unrestricted = true
 				return
 			}
-		next:
 			for _, c := range chans {
-				for _, u := range union {
-					if strings.EqualFold(u, c) {
-						continue next
-					}
+				if !containsFold(union, c) {
+					union = append(union, c)
 				}
-				union = append(union, c)
 			}
 			return
 		}

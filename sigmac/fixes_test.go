@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +125,132 @@ func TestSanitizeCSVRow(t *testing.T) {
 	for i := range want {
 		if row[i] != want[i] {
 			t.Errorf("cell %d = %q, want %q", i, row[i], want[i])
+		}
+	}
+}
+
+const procCreationRule = `
+title: cmd started
+name: cmd_started
+id: 33333333-3333-3333-3333-333333333333
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  s:
+    Image|endswith: '\cmd.exe'
+  condition: s
+`
+
+// Sysmon logs every category to one channel, so the channel alone doesn't
+// scope a process_creation rule: a network connection (EID 3) made by cmd.exe
+// carries the same Image field and must not match.
+func TestCategoryRulesScopedByEventID(t *testing.T) {
+	defer func() { channelFilterEnabled = true }()
+	channelFilterEnabled = true
+
+	rule, err := sigma.ParseRule([]byte(procCreationRule))
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := buildBundles([]sigma.Rule{rule})
+	ctx := context.Background()
+	event := func(eventID int) map[string]interface{} {
+		return map[string]interface{}{
+			"Channel": "Microsoft-Windows-Sysmon/Operational",
+			"EventID": eventID,
+			"Image":   `C:\Windows\System32\cmd.exe`,
+		}
+	}
+	if rows := matchEvent(ctx, event(3), "f.evtx", "1", groups, nil); len(rows) != 0 {
+		t.Fatalf("process_creation rule matched a Sysmon network connection event (%d rows)", len(rows))
+	}
+	if rows := matchEvent(ctx, event(1), "f.evtx", "2", groups, nil); len(rows) != 1 {
+		t.Fatalf("process_creation rule should match Sysmon EID 1, got %d row(s)", len(rows))
+	}
+}
+
+// The rules a correlation evaluates internally get the same channel/event ID
+// scoping, and a referenced rule only alerts on its own with `generate: true`.
+func TestCorrelationScopingAndGenerate(t *testing.T) {
+	defer func() { channelFilterEnabled = true }()
+	channelFilterEnabled = true
+
+	dir := t.TempDir()
+	write := func(name, contents string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("proc.yml", procCreationRule)
+	write("corr.yml", `
+title: cmd burst
+id: 44444444-4444-4444-4444-444444444444
+correlation:
+  type: event_count
+  rules: [cmd_started]
+  timespan: 10m
+  condition:
+    gte: 2
+`)
+	rules, err := loadRules(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ce, err := evaluator.ForCorrelation(rules[0], rules, evaluator.WithEventFilter(logsourceFilter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	correlations := []corrEntry{{ce: ce, channels: correlationChannels(rules[0], rules)}}
+	hidden := hiddenByCorrelations(correlations)
+	detection := withoutHidden([]sigma.Rule{rules[1]}, hidden)
+	if len(detection) != 0 {
+		t.Fatalf("a rule referenced by a correlation without generate: true must not alert on its own")
+	}
+	groups := buildBundles(detection)
+
+	ctx := context.Background()
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	event := func(eventID int, at time.Duration) map[string]interface{} {
+		return map[string]interface{}{
+			"Channel":     "Microsoft-Windows-Sysmon/Operational",
+			"EventID":     eventID,
+			"Image":       `C:\Windows\System32\cmd.exe`,
+			"TimeCreated": float64(base.Add(at).Unix()),
+		}
+	}
+	// Network connections and image loads of cmd.exe are not process creations
+	// and must not count towards the correlation.
+	for i, eid := range []int{3, 7, 1} {
+		if rows := matchEvent(ctx, event(eid, time.Duration(i)*time.Second), "f.evtx", "1", groups, correlations); len(rows) != 0 {
+			t.Fatalf("event %d (EID %d) fired %d row(s); out-of-scope events counted", i, eid, len(rows))
+		}
+	}
+	rows := matchEvent(ctx, event(1, 5*time.Second), "f.evtx", "2", groups, correlations)
+	if len(rows) != 1 || rows[0][6] != "44444444-4444-4444-4444-444444444444" {
+		t.Fatalf("second process creation should fire only the correlation, got %v", rows)
+	}
+
+	// With generate: true the referenced rule alerts on its own as well.
+	rules[0].Correlation.Generate = true
+	ce, err = evaluator.ForCorrelation(rules[0], rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hidden := hiddenByCorrelations([]corrEntry{{ce: ce}}); len(withoutHidden([]sigma.Rule{rules[1]}, hidden)) != 1 {
+		t.Fatal("generate: true must keep the referenced rule's own alerts")
+	}
+}
+
+// Rules for other products reuse Windows field names (Image, CommandLine) and
+// would false-positive on evtx events.
+func TestTargetsWindows(t *testing.T) {
+	for _, tc := range []struct {
+		product string
+		want    bool
+	}{{"", true}, {"windows", true}, {"Windows", true}, {"linux", false}, {"macos", false}} {
+		if got := targetsWindows(sigma.Logsource{Product: tc.product}); got != tc.want {
+			t.Errorf("targetsWindows(%q) = %v, want %v", tc.product, got, tc.want)
 		}
 	}
 }

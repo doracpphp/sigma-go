@@ -127,3 +127,38 @@ detection:
 		t.Errorf("rule classified as %q", ft)
 	}
 }
+
+// value_avg thresholds may be fractional; the parsed threshold and a
+// Marshal/Parse round trip must keep the exact value.
+func TestCorrelationFractionalThreshold(t *testing.T) {
+	rule, err := ParseRule([]byte(`
+title: avg
+correlation:
+  type: value_avg
+  rules: [r]
+  timespan: 1h
+  condition:
+    field: BytesOut
+    gt: 2.5
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rule.Correlation.Condition.Terms[0].Value(); got != 2.5 {
+		t.Fatalf("threshold = %v, want 2.5", got)
+	}
+	out, err := yaml.Marshal(rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reparsed, err := ParseRule(out)
+	if err != nil {
+		t.Fatalf("re-parsing marshalled rule: %v\n%s", err, out)
+	}
+	if got := reparsed.Correlation.Condition.Terms[0].Value(); got != 2.5 {
+		t.Fatalf("threshold after round trip = %v, want 2.5\n%s", got, out)
+	}
+	if reparsed.Correlation.Type != CorrelationValueAvg || reparsed.Correlation.Condition.Field != "BytesOut" {
+		t.Fatalf("correlation lost in round trip: %+v", reparsed.Correlation)
+	}
+}

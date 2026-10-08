@@ -19,6 +19,7 @@ type RuleEvaluator struct {
 	fieldmappings    map[string][]string    // a compiled mapping from rule fieldnames to possible event fieldnames
 
 	expandPlaceholder func(ctx context.Context, placeholderName string) ([]string, error)
+	eventFilter       func(rule sigma.Rule, event Event) bool
 	caseSensitive     bool
 	lazy              bool
 	comparators       map[string]modifiers.Comparator
@@ -143,6 +144,10 @@ func (rule RuleEvaluator) matches(ctx context.Context, event Event, comparators 
 		Match:            false,
 		SearchResults:    map[string]bool{},
 		ConditionResults: make([]bool, len(rule.Detection.Conditions)),
+	}
+
+	if rule.eventFilter != nil && !rule.eventFilter(rule.Rule, event) {
+		return result, nil
 	}
 
 	if !rule.lazy {

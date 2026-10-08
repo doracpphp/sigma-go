@@ -8,7 +8,6 @@ import (
 
 	"github.com/doracpphp/sigma-go"
 	"github.com/doracpphp/sigma-go/evaluator"
-	"github.com/doracpphp/sigma-go/internal/slidingstatistics"
 )
 
 // When the caller supplies the event timestamp via evaluator.WithEventTime, the
@@ -353,10 +352,10 @@ detection:
 func TestSweepEvictsIdleEntries(t *testing.T) {
 	i := &inMemory{
 		timeframe: time.Minute,
-		counts:    map[string]*tracked[*slidingstatistics.Counter]{},
+		counts:    map[string]*tracked[*windowTracker]{},
 		distincts: map[string]*tracked[*distinctTracker]{},
-		averages:  map[string]*tracked[*slidingstatistics.Averager]{},
-		sums:      map[string]*tracked[*slidingstatistics.Counter]{},
+		averages:  map[string]*tracked[*windowTracker]{},
+		sums:      map[string]*tracked[*windowTracker]{},
 		extremes:  map[string]*tracked[*extremeTracker]{},
 	}
 	ctx := context.Background()
@@ -475,11 +474,11 @@ func TestTrackersHighRate(t *testing.T) {
 // With more group keys than one sweep batch, repeated sweeps must still evict
 // all idle entries (partial sweeps rely on randomised map iteration order).
 func TestSweepEventuallyEvictsBeyondBatch(t *testing.T) {
-	m := map[string]*tracked[*slidingstatistics.Counter]{}
+	m := map[string]*tracked[*windowTracker]{}
 	stale := time.Now().Add(-time.Hour)
 	for i := 0; i < 3*sweepBatch; i++ {
-		m[fmt.Sprintf("k%d", i)] = &tracked[*slidingstatistics.Counter]{
-			value:    slidingstatistics.Count(time.Minute),
+		m[fmt.Sprintf("k%d", i)] = &tracked[*windowTracker]{
+			value:    &windowTracker{window: time.Minute},
 			window:   time.Minute,
 			lastSeen: stale,
 		}
@@ -491,5 +490,66 @@ func TestSweepEventuallyEvictsBeyondBatch(t *testing.T) {
 	}
 	if len(m) != 0 {
 		t.Fatalf("expected all idle entries evicted after repeated sweeps, %d remain", len(m))
+	}
+}
+
+// count() must count exactly the events within one timeframe of the newest.
+// The previous two-bucket approximation missed two events 2 minutes apart when
+// they straddled a bucket boundary (count() >= 2 never fired) and counted events
+// 18 minutes apart inside a 10 minute timeframe (count() > 1 fired).
+func TestCountIsExactAcrossBucketBoundaries(t *testing.T) {
+	newEvaluator := func(condition string) *evaluator.RuleEvaluator {
+		rule, err := sigma.ParseRule([]byte(`
+title: count
+detection:
+  s:
+    EventID: 4625
+  timeframe: 10m
+  condition: ` + condition + `
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return evaluator.ForRule(rule, InMemory(time.Hour)...)
+	}
+	feed := func(e *evaluator.RuleEvaluator, times ...time.Time) bool {
+		var match bool
+		for _, ts := range times {
+			r, err := e.Matches(evaluator.WithEventTime(context.Background(), ts), map[string]interface{}{"EventID": 4625})
+			if err != nil {
+				t.Fatal(err)
+			}
+			match = r.Match
+		}
+		return match
+	}
+
+	boundary := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC) // a multiple of 10m
+	if !feed(newEvaluator("s | count() >= 2"), boundary.Add(-time.Minute), boundary.Add(time.Minute)) {
+		t.Error("two events 2m apart within a 10m timeframe must reach count() >= 2")
+	}
+	if feed(newEvaluator("s | count() > 1"), boundary.Add(-9*time.Minute), boundary.Add(9*time.Minute)) {
+		t.Error("two events 18m apart must not both count within a 10m timeframe")
+	}
+}
+
+func TestWindowTrackerSumAndAverage(t *testing.T) {
+	w := &windowTracker{window: 5 * time.Minute}
+	base := time.Now()
+	w.observe(base, 10)
+	w.observe(base.Add(time.Minute), 20)
+	w.observe(base.Add(30*time.Second), 30) // out of order, still in window
+	if w.count() != 3 || w.sum != 60 {
+		t.Fatalf("count=%d sum=%v, want 3 and 60", w.count(), w.sum)
+	}
+	// At +5m30s the sample at base has left the window; the others remain.
+	w.observe(base.Add(5*time.Minute+30*time.Second), 40)
+	if w.count() != 3 || w.sum != 90 {
+		t.Fatalf("count=%d sum=%v, want 3 and 90", w.count(), w.sum)
+	}
+	// Far in the future everything earlier expires.
+	w.observe(base.Add(time.Hour), 5)
+	if w.count() != 1 || w.sum != 5 {
+		t.Fatalf("count=%d sum=%v, want 1 and 5", w.count(), w.sum)
 	}
 }

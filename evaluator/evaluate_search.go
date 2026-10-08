@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
-	"sync"
 )
 
 func (rule RuleEvaluator) evaluateSearchExpression(search sigma.SearchExpr, searchResults func(string) bool) bool {
@@ -39,8 +38,19 @@ func (rule RuleEvaluator) evaluateSearchExpression(search sigma.SearchExpr, sear
 		// If `s.Name` is not defined, this is always false
 		return searchResults(s.Name)
 
+	case sigma.OneOfIdentifier:
+		// `1 of selection` (no wildcard) is a pattern matching exactly one search
+		// identifier, so it reduces to that identifier.
+		return searchResults(s.Ident.Name)
+
+	case sigma.AllOfIdentifier:
+		return searchResults(s.Ident.Name)
+
 	case sigma.OneOfThem:
 		for name := range rule.Detection.Searches {
+			if !includedInThem(name) {
+				continue
+			}
 			if rule.evaluateSearchExpression(sigma.SearchIdentifier{Name: name}, searchResults) {
 				return true
 			}
@@ -62,6 +72,9 @@ func (rule RuleEvaluator) evaluateSearchExpression(search sigma.SearchExpr, sear
 
 	case sigma.AllOfThem:
 		for name := range rule.Detection.Searches {
+			if !includedInThem(name) {
+				continue
+			}
 			if !rule.evaluateSearchExpression(sigma.SearchIdentifier{Name: name}, searchResults) {
 				return false
 			}
@@ -82,6 +95,14 @@ func (rule RuleEvaluator) evaluateSearchExpression(search sigma.SearchExpr, sear
 		return true
 	}
 	panic(fmt.Sprintf("unhandled node type %T", search))
+}
+
+// includedInThem reports whether a search identifier is covered by `1 of them`
+// / `all of them`. Per the Sigma specification, identifiers starting with an
+// underscore are excluded by convention (pySigma does the same), so helper
+// searches like `_filter` don't turn `1 of them` into a match on their own.
+func includedInThem(name string) bool {
+	return !strings.HasPrefix(name, "_")
 }
 
 func (rule RuleEvaluator) evaluateSearch(ctx context.Context, search sigma.Search, event Event, comparators map[string]modifiers.Comparator) (bool, error) {
@@ -193,13 +214,19 @@ eventMatcher:
 
 // matchKeywords implements Sigma keyword (full-text) search: a list of strings
 // matched against every field value in the event. The keywords are OR-ed, and a
-// single keyword matches if it is found (case-insensitively by default, with `*`
-// and `?` wildcards) within any field value.
+// single keyword matches if it is found (case-insensitively by default) within
+// any field value. Keywords follow the same value syntax as field values: `*`
+// and `?` are wildcards and `\*`, `\?`, `\\` escape them, so the standard
+// `contains` comparator implements the match.
 func (rule RuleEvaluator) matchKeywords(keywords []string, event Event) bool {
+	contains := modifiers.Comparators["contains"]
+	if rule.caseSensitive {
+		contains = modifiers.ComparatorsCaseSensitive["contains"]
+	}
 	values := allEventValues(event)
 	for _, keyword := range keywords {
 		for _, value := range values {
-			if keywordMatches(keyword, value, rule.caseSensitive) {
+			if matched, _ := contains.Matches(value, keyword); matched {
 				return true
 			}
 		}
@@ -207,7 +234,9 @@ func (rule RuleEvaluator) matchKeywords(keywords []string, event Event) bool {
 	return false
 }
 
-// allEventValues returns the string form of every top-level field value in the event.
+// allEventValues returns the string form of every top-level field value in the
+// event. Absent (nil) values are skipped: they have no text to search, and their
+// "<nil>" rendering would otherwise match keywords like "nil".
 func allEventValues(event Event) []string {
 	switch evt := event.(type) {
 	case map[string]string:
@@ -219,69 +248,15 @@ func allEventValues(event Event) []string {
 	case map[string]interface{}:
 		out := make([]string, 0, len(evt))
 		for _, v := range evt {
+			if v == nil {
+				continue
+			}
 			out = append(out, modifiers.CoerceString(v))
 		}
 		return out
 	default:
 		return nil
 	}
-}
-
-func keywordMatches(keyword, value string, caseSensitive bool) bool {
-	if strings.ContainsAny(keyword, "*?") {
-		re, err := keywordRegexpCached(keyword, caseSensitive)
-		if err != nil {
-			return false
-		}
-		return re.MatchString(value)
-	}
-	if caseSensitive {
-		return strings.Contains(value, keyword)
-	}
-	return strings.Contains(strings.ToLower(value), strings.ToLower(keyword))
-}
-
-// keywordRegexps caches compiled keyword patterns: keywordMatches runs once per
-// keyword per field value per event, and compiling dominates the match cost.
-// Keywords come from rules so the cardinality is bounded by the ruleset.
-var keywordRegexps sync.Map // map[keywordKey]*regexp.Regexp
-
-type keywordKey struct {
-	keyword       string
-	caseSensitive bool
-}
-
-func keywordRegexpCached(keyword string, caseSensitive bool) (*regexp.Regexp, error) {
-	key := keywordKey{keyword, caseSensitive}
-	if cached, ok := keywordRegexps.Load(key); ok {
-		return cached.(*regexp.Regexp), nil
-	}
-	re, err := keywordRegexp(keyword, caseSensitive)
-	if err != nil {
-		return nil, err
-	}
-	keywordRegexps.Store(key, re)
-	return re, nil
-}
-
-// keywordRegexp converts a keyword containing `*`/`?` wildcards into an unanchored
-// regexp (keyword search has "contains" semantics).
-func keywordRegexp(keyword string, caseSensitive bool) (*regexp.Regexp, error) {
-	var b strings.Builder
-	if !caseSensitive {
-		b.WriteString("(?i)")
-	}
-	for _, r := range keyword {
-		switch r {
-		case '*':
-			b.WriteString(".*")
-		case '?':
-			b.WriteString(".")
-		default:
-			b.WriteString(regexp.QuoteMeta(string(r)))
-		}
-	}
-	return regexp.Compile(b.String())
 }
 
 // placeholderToken matches a single `%name%` placeholder. Names are restricted to

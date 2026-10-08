@@ -8,16 +8,15 @@ import (
 	"time"
 
 	"github.com/doracpphp/sigma-go/evaluator"
-	"github.com/doracpphp/sigma-go/internal/slidingstatistics"
 )
 
 type inMemory struct {
 	sync.Mutex
 	timeframe time.Duration
-	counts    map[string]*tracked[*slidingstatistics.Counter]
+	counts    map[string]*tracked[*windowTracker]
 	distincts map[string]*tracked[*distinctTracker]
-	averages  map[string]*tracked[*slidingstatistics.Averager]
-	sums      map[string]*tracked[*slidingstatistics.Counter]
+	averages  map[string]*tracked[*windowTracker]
+	sums      map[string]*tracked[*windowTracker]
 	extremes  map[string]*tracked[*extremeTracker]
 	ops       int
 }
@@ -112,11 +111,11 @@ func (i *inMemory) count(ctx context.Context, groupBy evaluator.GroupedByValues)
 	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
-	c := getTracked(i.counts, groupBy.Key(), window, now, func() *slidingstatistics.Counter {
-		return slidingstatistics.Count(window)
+	c := getTracked(i.counts, groupBy.Key(), window, now, func() *windowTracker {
+		return &windowTracker{window: window}
 	})
-
-	return float64(c.IncrementN(now, 1)), nil
+	c.observe(now, 1)
+	return float64(c.count()), nil
 }
 
 // countDistinct counts the number of distinct values seen for a group within the
@@ -140,11 +139,11 @@ func (i *inMemory) average(ctx context.Context, groupBy evaluator.GroupedByValue
 	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
-	a := getTracked(i.averages, groupBy.Key(), window, now, func() *slidingstatistics.Averager {
-		return slidingstatistics.Average(window)
+	a := getTracked(i.averages, groupBy.Key(), window, now, func() *windowTracker {
+		return &windowTracker{window: window}
 	})
-
-	return a.Average(now, value), nil
+	a.observe(now, value)
+	return a.sum / float64(a.count()), nil
 }
 
 func (i *inMemory) sum(ctx context.Context, groupBy evaluator.GroupedByValues, value float64) (float64, error) {
@@ -153,11 +152,11 @@ func (i *inMemory) sum(ctx context.Context, groupBy evaluator.GroupedByValues, v
 	now := eventNow(ctx)
 	i.maybeSweep(now)
 	window := i.window(groupBy)
-	a := getTracked(i.sums, groupBy.Key(), window, now, func() *slidingstatistics.Counter {
-		return slidingstatistics.Count(window)
+	a := getTracked(i.sums, groupBy.Key(), window, now, func() *windowTracker {
+		return &windowTracker{window: window}
 	})
-
-	return a.IncrementN(now, value), nil
+	a.observe(now, value)
+	return a.sum, nil
 }
 
 func (i *inMemory) min(ctx context.Context, groupBy evaluator.GroupedByValues, value float64) (float64, error) {
@@ -183,6 +182,52 @@ func (i *inMemory) max(ctx context.Context, groupBy evaluator.GroupedByValues, v
 	})
 	return t.observeMax(now, value), nil
 }
+
+// windowTracker keeps every sample inside a sliding window so that count(),
+// sum() and avg() are exact: the result covers precisely the samples within one
+// window of the newest one. (A weighted two-bucket approximation, as used by
+// rate limiters, both misses bursts that straddle a bucket boundary and counts
+// events that are already outside the window, so thresholds like
+// `count() >= 2` would fire or not depending on where the bucket edge falls.)
+//
+// Samples are kept in time order; eviction advances head instead of shifting,
+// and the slice is compacted once the evicted prefix dominates it, so an
+// observation is O(1) amortised for in-order streams.
+type windowTracker struct {
+	window  time.Duration
+	samples []sample // time-ordered; samples[head:] are inside the window
+	head    int
+	sum     float64 // sum of samples[head:].value
+}
+
+func (w *windowTracker) observe(now time.Time, value float64) {
+	// Insert in time order (an append for in-order streams) so eviction from the
+	// front stays correct when events arrive slightly out of order.
+	pos := len(w.samples)
+	for pos > w.head && w.samples[pos-1].at.After(now) {
+		pos--
+	}
+	w.samples = append(w.samples, sample{})
+	copy(w.samples[pos+1:], w.samples[pos:])
+	w.samples[pos] = sample{at: now, value: value}
+	w.sum += value
+
+	cutoff := w.samples[len(w.samples)-1].at.Add(-w.window)
+	for w.head < len(w.samples) && w.samples[w.head].at.Before(cutoff) {
+		w.sum -= w.samples[w.head].value
+		w.head++
+	}
+	if w.head == len(w.samples) {
+		// Reset rather than carry accumulated floating-point drift forward.
+		w.samples, w.head, w.sum = w.samples[:0], 0, 0
+	} else if w.head > 0 && 2*w.head >= len(w.samples) {
+		n := copy(w.samples, w.samples[w.head:])
+		w.samples, w.head = w.samples[:n], 0
+	}
+}
+
+// count returns the number of samples inside the window.
+func (w *windowTracker) count() int { return len(w.samples) - w.head }
 
 // extremeTracker computes the min/max over a sliding window using monotonic
 // deques (the standard sliding-window-minimum algorithm): when a new sample
@@ -290,10 +335,10 @@ func InMemory(timeframe time.Duration) []evaluator.Option {
 	}
 	i := &inMemory{
 		timeframe: timeframe,
-		counts:    map[string]*tracked[*slidingstatistics.Counter]{},
+		counts:    map[string]*tracked[*windowTracker]{},
 		distincts: map[string]*tracked[*distinctTracker]{},
-		averages:  map[string]*tracked[*slidingstatistics.Averager]{},
-		sums:      map[string]*tracked[*slidingstatistics.Counter]{},
+		averages:  map[string]*tracked[*windowTracker]{},
+		sums:      map[string]*tracked[*windowTracker]{},
 		extremes:  map[string]*tracked[*extremeTracker]{},
 	}
 

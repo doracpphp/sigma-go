@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"reflect"
 	"regexp"
@@ -821,62 +822,64 @@ func CoerceString(v interface{}) string {
 	}
 }
 
-// coerceNumeric makes both operands into the widest possible number of the same type
+// coerceNumeric makes both operands into the widest possible number of the same
+// type: two int64s when both are integers, otherwise two float64s. Every Go
+// integer and float kind is accepted (event sources such as the evtx parser
+// produce uint16/uint32/uint64 values), as are strings holding a number.
 func coerceNumeric(left, right interface{}) (interface{}, interface{}, error) {
-	// Check for nil interface, otherwise the function panics
-	if left == nil || right == nil {
+	l, lok := toNumber(left)
+	r, rok := toNumber(right)
+	if !lok || !rok {
 		return nil, nil, fmt.Errorf("cannot coerce %T and %T to numeric", left, right)
 	}
-	leftV := reflect.ValueOf(left)
-	leftType := reflect.ValueOf(left).Type()
-	rightV := reflect.ValueOf(right)
-	rightType := reflect.ValueOf(right).Type()
-
-	switch {
-	// Both integers or both floats? Return directly
-	case leftType.Kind() == reflect.Int && rightType.Kind() == reflect.Int:
-		fallthrough
-	case leftType.Kind() == reflect.Float64 && rightType.Kind() == reflect.Float64:
-		return left, right, nil
-
-	// Mixed integer, float? Return two floats
-	case leftType.Kind() == reflect.Int && rightType.Kind() == reflect.Float64:
-		fallthrough
-	case leftType.Kind() == reflect.Float64 && rightType.Kind() == reflect.Int:
-		floatType := reflect.TypeOf(float64(0))
-		return leftV.Convert(floatType).Interface(), rightV.Convert(floatType).Interface(), nil
-
-	// One or more strings? Parse and recurse.
-	// We use `yaml.Unmarshal` to parse the string because it's a cheat's way of parsing either an integer or a float
-	case leftType.Kind() == reflect.String:
-		var leftParsed interface{}
-		if err := yaml.Unmarshal([]byte(left.(string)), &leftParsed); err != nil {
-			return nil, nil, err
-		}
-		// Only recurse when the string parsed to a number, otherwise we'd loop
-		// forever. A type switch also guards nil (from "", "~", "null"), which
-		// reflect.TypeOf(...).Kind() would panic on.
-		switch leftParsed.(type) {
-		case int, float64:
-		default:
-			return nil, nil, fmt.Errorf("cannot coerce %T and %T to numeric", left, right)
-		}
-		return coerceNumeric(leftParsed, right)
-	case rightType.Kind() == reflect.String:
-		var rightParsed interface{}
-		if err := yaml.Unmarshal([]byte(right.(string)), &rightParsed); err != nil {
-			return nil, nil, err
-		}
-		switch rightParsed.(type) {
-		case int, float64:
-		default:
-			return nil, nil, fmt.Errorf("cannot coerce %T and %T to numeric", left, right)
-		}
-		return coerceNumeric(left, rightParsed)
-
-	default:
-		return nil, nil, fmt.Errorf("cannot coerce %T and %T to numeric", left, right)
+	li, lInt := l.(int64)
+	ri, rInt := r.(int64)
+	if lInt && rInt {
+		return li, ri, nil
 	}
+	return asFloat(l), asFloat(r), nil
+}
+
+// toNumber converts v to an int64 or float64. Unsigned values beyond the int64
+// range become float64. Strings are parsed with `yaml.Unmarshal`, a cheat's way
+// of accepting integers (including 0x hex and 0o octal) and floats alike.
+func toNumber(v interface{}) (interface{}, bool) {
+	if v == nil {
+		return nil, false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u := rv.Uint()
+		if u <= math.MaxInt64 {
+			return int64(u), true
+		}
+		return float64(u), true
+	case reflect.Float32, reflect.Float64:
+		return rv.Float(), true
+	case reflect.String:
+		var parsed interface{}
+		if err := yaml.Unmarshal([]byte(rv.String()), &parsed); err != nil {
+			return nil, false
+		}
+		// Only accept a parse that produced a number; anything else (nil from "",
+		// "~" or "null", strings, maps) isn't numeric. Recursing on a string would
+		// loop forever.
+		switch parsed.(type) {
+		case int, int64, uint64, float64:
+			return toNumber(parsed)
+		}
+	}
+	return nil, false
+}
+
+func asFloat(v interface{}) float64 {
+	if i, ok := v.(int64); ok {
+		return float64(i)
+	}
+	return v.(float64)
 }
 
 func compareNumeric(left, right interface{}) (gt, gte, lt, lte bool, err error) {
@@ -886,9 +889,9 @@ func compareNumeric(left, right interface{}) (gt, gte, lt, lte bool, err error) 
 	}
 
 	switch left.(type) {
-	case int:
-		left := left.(int)
-		right := right.(int)
+	case int64:
+		left := left.(int64)
+		right := right.(int64)
 		return left > right, left >= right, left < right, left <= right, nil
 	case float64:
 		left := left.(float64)
