@@ -5,33 +5,66 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
 
-  build:
-    name: Build
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v4
 
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v2
+    - uses: actions/setup-go@v5
       with:
-        go-version: ^1.13
-      id: go
+        go-version: stable
 
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v2
-
-    - name: Get dependencies
+    - name: gofmt
       run: |
-        go get -v -t -d ./...
-        if [ -f Gopkg.toml ]; then
-            curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
-            dep ensure
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "Files need gofmt:"
+          echo "$unformatted"
+          exit 1
         fi
 
+    # The structtag analyzer is disabled: participle grammar tags
+    # (internal/grammar) aren't key:"value" pairs by design.
+    - name: go vet
+      run: go vet -structtag=false ./...
+
+    - name: go mod tidy
+      run: |
+        go mod tidy
+        git diff --exit-code go.mod go.sum
+
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.21.x is the minimum version declared in go.mod.
+        go: [ '1.21.x', 'stable' ]
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go }}
+
+    - name: Verify modules
+      run: go mod verify
+
     - name: Build
-      run: go build -v .
+      run: go build ./...
+
+    # sigmac pulls in Windows-only code through the evtx parser.
+    - name: Build sigmac for Windows
+      run: GOOS=windows go build -o /dev/null ./sigmac
 
     - name: Test
-      run: go test -v .
+      run: go test -race ./...
