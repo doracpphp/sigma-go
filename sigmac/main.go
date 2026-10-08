@@ -45,7 +45,7 @@ func main() {
 	configPath := flags.String("config", "", "optional Sigma config file (field mappings)")
 	outPath := flags.String("out", "", "output CSV file (default: stdout)")
 	timeframe := flags.Duration("timeframe", time.Hour, "default sliding window for aggregation rules without their own timeframe")
-	channelFilter := flags.Bool("channel-filter", true, "only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules for non-Windows products (faster, and no cross-channel or cross-category matches)")
+	channelFilter := flags.Bool("channel-filter", true, "only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules that don't target Windows event logs (faster, and no cross-channel or cross-category matches)")
 	exclude := flags.String("exclude", "", "comma-separated `files` of rule IDs to skip, one \"<uuid>  # comment\" per line (e.g. Hayabusa's exclude_rules.txt,noisy_rules.txt)")
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: sigmac -rules <file|dir> [-config c.yml] [-out alerts.csv] <file.evtx> ...")
@@ -193,7 +193,7 @@ func run(rulesPath, configPath, outPath string, timeframe time.Duration, inputs 
 		}
 		rules = kept
 		if skipped > 0 {
-			fmt.Fprintf(os.Stderr, "skipped %d non-Windows rule(s) (logsource product is not windows)\n", skipped)
+			fmt.Fprintf(os.Stderr, "skipped %d non-Windows rule(s) (logsource doesn't target Windows event logs)\n", skipped)
 		}
 	}
 	if len(rules) == 0 {
@@ -549,13 +549,25 @@ func flattenSystem(sys *ordereddict.Dict, out map[string]interface{}) {
 // mergeLeaves lifts the scalar leaves of d into out. Nested dicts (e.g. the
 // single wrapper element inside UserData) are descended into so their fields
 // also land at the top level, matching how Sigma rules reference them.
+//
+// Some providers name EventData fields with spaces (Windows Defender writes
+// "New Value", "Product Name"), while Sigma rules use the space-free form
+// (`NewValue`), so such fields are also exposed under that name unless the
+// event has a real field of that name.
 func mergeLeaves(d *ordereddict.Dict, out map[string]interface{}) {
 	for _, k := range d.Keys() {
 		v, _ := d.Get(k)
 		if sub, ok := v.(*ordereddict.Dict); ok {
 			mergeLeaves(sub, out)
-		} else {
-			out[k] = normalizeEventValue(k, v)
+			continue
+		}
+		val := normalizeEventValue(k, v)
+		out[k] = val
+		if strings.Contains(k, " ") {
+			alias := strings.ReplaceAll(k, " ", "")
+			if _, exists := d.Get(alias); !exists {
+				out[alias] = val
+			}
 		}
 	}
 }

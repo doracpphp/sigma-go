@@ -291,10 +291,17 @@ func (rule *RuleEvaluator) getMatcherValues(ctx context.Context, matcher sigma.F
 		}
 
 		switch {
-		case len(value) > 2 && strings.HasPrefix(value, "%") && strings.HasSuffix(value, "%"):
+		case len(value) > 2 && strings.HasPrefix(value, "%") && strings.HasSuffix(value, "%") &&
+			(hasExpand || rule.expandPlaceholder != nil):
 			// The whole value is a placeholder; expand it to its values. A bare "%"
 			// or "%%" is a literal percent (e.g. `CommandLine|contains: '%'` to detect
 			// environment variables), not a `%name%` placeholder.
+			//
+			// Sigma v2 only treats values as placeholders under the `expand`
+			// modifier; without it, a value like `%comspec%` is literal Windows
+			// environment-variable text that rules match verbatim. Values are
+			// still expanded implicitly when an expander is configured, for
+			// compatibility with legacy rules that predate the modifier.
 			if rule.expandPlaceholder == nil {
 				return nil, fmt.Errorf("can't expand %s, no placeholder expander function defined", value)
 			}

@@ -20,7 +20,7 @@ var serviceChannels = map[string][]string{
 	"system":                               {"System"},
 	"application":                          {"Application"},
 	"sysmon":                               {"Microsoft-Windows-Sysmon/Operational"},
-	"powershell":                           {"Microsoft-Windows-PowerShell/Operational"},
+	"powershell":                           {"Microsoft-Windows-PowerShell/Operational", "PowerShellCore/Operational"},
 	"powershell-classic":                   {"Windows PowerShell"},
 	"taskscheduler":                        {"Microsoft-Windows-TaskScheduler/Operational"},
 	"wmi":                                  {"Microsoft-Windows-WMI-Activity/Operational"},
@@ -41,6 +41,20 @@ var serviceChannels = map[string][]string{
 	"shell-core":                           {"Microsoft-Windows-Shell-Core/Operational"},
 	"openssh":                              {"OpenSSH/Operational"},
 	"security-mitigations":                 {"Microsoft-Windows-Security-Mitigations/Kernel Mode", "Microsoft-Windows-Security-Mitigations/User Mode"},
+	"capi2":                                {"Microsoft-Windows-CAPI2/Operational"},
+	"dns-client":                           {"Microsoft-Windows-DNS Client Events/Operational"},
+	"dns-server-analytic":                  {"Microsoft-Windows-DNS-Server/Analytical"},
+	"smbclient-connectivity":               {"Microsoft-Windows-SmbClient/Connectivity"},
+	"smbserver-connectivity":               {"Microsoft-Windows-SMBServer/Connectivity"},
+	"ldap":                                 {"Microsoft-Windows-LDAP-Client/Debug"},
+	"lsa-server":                           {"Microsoft-Windows-LSA/Operational"},
+	"driver-framework":                     {"Microsoft-Windows-DriverFrameworks-UserMode/Operational"},
+	"diagnosis-scripted":                   {"Microsoft-Windows-Diagnosis-Scripted/Operational"},
+	"appmodel-runtime":                     {"Microsoft-Windows-AppModel-Runtime/Admin"},
+	"appxpackaging-om":                     {"Microsoft-Windows-AppxPackaging/Operational"},
+	"iis-configuration":                    {"Microsoft-IIS-Configuration/Operational"},
+	"microsoft-servicebus-client":          {"Microsoft-ServiceBus-Client"},
+	"certificateservicesclient-lifecycle-system": {"Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational"},
 	"applocker": {
 		"Microsoft-Windows-AppLocker/EXE and DLL",
 		"Microsoft-Windows-AppLocker/MSI and Script",
@@ -216,12 +230,22 @@ func logsourceFilter(rule sigma.Rule, event evaluator.Event) bool {
 	return ruleAppliesToEvent(rule.Logsource, field(m, "Channel"), field(m, "EventID"))
 }
 
-// targetsWindows reports whether a rule can apply to Windows event logs: its
-// logsource product is windows or unset. Rules for other products (linux,
-// macos, cloud, ...) reuse field names such as Image and CommandLine, so
-// evaluating them against evtx events only produces false positives.
+// targetsWindows reports whether a rule can apply to Windows event logs. Rules
+// for other products (linux, macos, cloud, ...) reuse field names such as Image
+// and CommandLine, so evaluating them against evtx events only produces false
+// positives. The same goes for product-less rules written for other log types
+// (webserver, proxy, dns, firewall, antivirus, database): their keyword and
+// field searches match unrelated Windows events. A rule without a product is
+// therefore only kept if its category/service is a known Windows log source, or
+// if its logsource doesn't restrict anything.
 func targetsWindows(ls sigma.Logsource) bool {
-	return ls.Product == "" || strings.EqualFold(ls.Product, "windows")
+	if ls.Product != "" {
+		return strings.EqualFold(ls.Product, "windows")
+	}
+	if ls.Category == "" && ls.Service == "" {
+		return true
+	}
+	return ruleScopes(ls) != nil
 }
 
 func containsFold(list []string, s string) bool {

@@ -91,14 +91,16 @@ Flags:
 | `-config` | Optional Sigma config file (field mappings). |
 | `-out` | Output CSV path (default: stdout). |
 | `-timeframe` | Default sliding window for aggregation rules that don't specify their own (default `1h`). |
-| `-channel-filter` | Only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules whose logsource product isn't `windows` (default `true`; faster and avoids cross-channel/cross-category matches). |
+| `-channel-filter` | Only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules whose logsource doesn't describe Windows event logs (another `product`, or product-less `webserver`/`proxy`/`dns`/... rules) (default `true`; faster and avoids cross-channel/cross-category matches). |
 | `-exclude` | Comma-separated files of rule IDs to skip, in `<uuid> # comment` format. Accepts Hayabusa's `exclude_rules.txt`/`noisy_rules.txt` verbatim. |
 
 Event field values are normalised on ingest the way Event Viewer/Hayabusa present
 them — leading/trailing whitespace is trimmed (Windows pads fields like
 `LogonProcessName`), and hex-typed fields (`Status`, `SubStatus`,
 `TicketEncryptionType`, `AccessMask`, `GrantedAccess`, logon IDs, ...) are rendered
-as `0x…` so rules such as `SubStatus: '0xC000006A'` match — and
+as `0x…` so rules such as `SubStatus: '0xC000006A'` match, and fields named with
+spaces (Windows Defender's `New Value`) are also available without them
+(`NewValue`) — and
 aggregation/correlation windows are keyed off each event's own timestamp, so
 `count()`/correlation results are correct when replaying historical logs.
 
