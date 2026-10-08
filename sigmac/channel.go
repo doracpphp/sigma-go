@@ -12,9 +12,8 @@ import (
 var channelFilterEnabled = true
 
 // serviceChannels maps a Sigma Windows logsource `service` to the evtx Channel(s)
-// it targets. Like Hayabusa's channel filter, a rule is only applied to events
-// from a matching channel, which avoids a rule meant for one log matching events
-// from another. Services not listed here impose no channel restriction.
+// it targets. A rule is only applied to events from a matching channel, which
+// avoids a rule meant for one log matching events from another. Services not listed here impose no channel restriction.
 var serviceChannels = map[string][]string{
 	"security":                             {"Security"},
 	"system":                               {"System"},

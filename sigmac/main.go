@@ -46,7 +46,7 @@ func main() {
 	outPath := flags.String("out", "", "output CSV file (default: stdout)")
 	timeframe := flags.Duration("timeframe", time.Hour, "default sliding window for aggregation rules without their own timeframe")
 	channelFilter := flags.Bool("channel-filter", true, "only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules that don't target Windows event logs (faster, and no cross-channel or cross-category matches)")
-	exclude := flags.String("exclude", "", "comma-separated `files` of rule IDs to skip, one \"<uuid>  # comment\" per line (e.g. Hayabusa's exclude_rules.txt,noisy_rules.txt)")
+	exclude := flags.String("exclude", "", "comma-separated `files` of rule IDs to skip, one \"<uuid>  # comment\" per line")
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: sigmac -rules <file|dir> [-config c.yml] [-out alerts.csv] <file.evtx> ...")
 		fmt.Fprintln(os.Stderr, "  <file.evtx> is one or more .evtx event log files")
@@ -100,8 +100,7 @@ func main() {
 
 // loadExcludeIDs reads rule IDs to skip from the given comma-separated list of
 // files. Each line is `<uuid>` optionally followed by `# comment`; blank lines and
-// lines starting with `#` are ignored. This accepts Hayabusa's exclude_rules.txt /
-// noisy_rules.txt verbatim.
+// lines starting with `#` are ignored.
 func loadExcludeIDs(spec string) (map[string]bool, error) {
 	ids := map[string]bool{}
 	for _, path := range strings.Split(spec, ",") {
@@ -437,7 +436,7 @@ func matchEvent(ctx context.Context, event map[string]interface{}, sourceFile, r
 	}
 
 	for _, g := range groups {
-		// Logsource filter (mirrors Hayabusa): a group whose rules target a
+		// Logsource filter: a group whose rules target a
 		// different channel or event ID is skipped before evaluation, so its
 		// aggregation state never sees this event.
 		if !scopeApplies(g.scopes, eventChannel, eventID) {
