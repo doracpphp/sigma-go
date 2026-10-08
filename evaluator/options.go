@@ -79,6 +79,19 @@ func CaseSensitive(e *RuleEvaluator) {
 	e.comparators = modifiers.ComparatorsCaseSensitive
 }
 
+// WithEventFilter restricts which events a rule is evaluated against. filter is
+// called before any search or aggregation is evaluated; when it returns false
+// the event is reported as not matching and leaves no trace in the rule's
+// aggregation or `near` state. Callers use it to scope rules to the events their
+// logsource targets (e.g. a Windows event log channel and event ID), which a
+// pre-filter outside the evaluator can't do for the rules a correlation
+// evaluates internally.
+func WithEventFilter(filter func(rule sigma.Rule, event Event) bool) Option {
+	return func(e *RuleEvaluator) {
+		e.eventFilter = filter
+	}
+}
+
 // LazyEvaluation allows the evaluator to skip evaluating searches if they won't affect the overall match result
 func LazyEvaluation(e *RuleEvaluator) {
 	e.lazy = true

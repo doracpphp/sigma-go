@@ -7,10 +7,10 @@
 //
 // Rules may be a single .yml file or a directory (scanned recursively for
 // .yml/.yaml). Detection rules (including count()/aggregation rules) are
-// evaluated in bundles grouped by the channel their logsource targets, so the
-// channel filter skips whole groups before evaluation; Sigma correlation rules
-// are evaluated separately. Aggregation and correlation windows use each
-// event's own timestamp, so historical replay is exact.
+// evaluated in bundles grouped by the channel and event IDs their logsource
+// targets, so the logsource filter skips whole groups before evaluation; Sigma
+// correlation rules are evaluated separately. Aggregation and correlation
+// windows use each event's own timestamp, so historical replay is exact.
 package main
 
 import (
@@ -45,7 +45,7 @@ func main() {
 	configPath := flags.String("config", "", "optional Sigma config file (field mappings)")
 	outPath := flags.String("out", "", "output CSV file (default: stdout)")
 	timeframe := flags.Duration("timeframe", time.Hour, "default sliding window for aggregation rules without their own timeframe")
-	channelFilter := flags.Bool("channel-filter", true, "only evaluate a rule against events from the channel its logsource targets (skips whole rule groups before evaluation: faster, and no cross-channel matches)")
+	channelFilter := flags.Bool("channel-filter", true, "only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules for non-Windows products (faster, and no cross-channel or cross-category matches)")
 	exclude := flags.String("exclude", "", "comma-separated `files` of rule IDs to skip, one \"<uuid>  # comment\" per line (e.g. Hayabusa's exclude_rules.txt,noisy_rules.txt)")
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: sigmac -rules <file|dir> [-config c.yml] [-out alerts.csv] <file.evtx> ...")
@@ -124,21 +124,21 @@ func loadExcludeIDs(spec string) (map[string]bool, error) {
 	return ids, nil
 }
 
-// bundleGroup is a set of detection rules sharing one channel restriction,
-// evaluated together. The channel filter is applied per group before
-// evaluation: an event from another channel never reaches the group's
+// bundleGroup is a set of detection rules sharing one logsource scope (channels
+// and event IDs), evaluated together. The scope filter is applied per group
+// before evaluation: an event outside the scope never reaches the group's
 // evaluators, so it can't inflate stateful aggregation (count() etc.) state,
 // and skipped groups cost nothing.
 type bundleGroup struct {
-	channels []string // evtx channels the group's rules target; nil = no restriction
-	bundle   evaluator.RuleEvaluatorBundle
+	scopes []logScope // what the group's rules target; nil = no restriction
+	bundle evaluator.RuleEvaluatorBundle
 }
 
 func buildBundles(rules []sigma.Rule, options ...evaluator.Option) []bundleGroup {
 	byKey := map[string][]sigma.Rule{}
 	var order []string
 	for _, r := range rules {
-		k := strings.ToLower(strings.Join(ruleChannels(r.Logsource), "\x00"))
+		k := scopeKey(ruleScopes(r.Logsource))
 		if _, ok := byKey[k]; !ok {
 			order = append(order, k)
 		}
@@ -148,8 +148,8 @@ func buildBundles(rules []sigma.Rule, options ...evaluator.Option) []bundleGroup
 	for _, k := range order {
 		rs := byKey[k]
 		groups = append(groups, bundleGroup{
-			channels: ruleChannels(rs[0].Logsource),
-			bundle:   evaluator.ForRules(rs, options...),
+			scopes: ruleScopes(rs[0].Logsource),
+			bundle: evaluator.ForRules(rs, options...),
 		})
 	}
 	return groups
@@ -181,6 +181,21 @@ func run(rulesPath, configPath, outPath string, timeframe time.Duration, inputs 
 		rules = kept
 		fmt.Fprintf(os.Stderr, "excluded %d rule(s) by ID\n", excluded)
 	}
+	if channelFilterEnabled {
+		kept := rules[:0]
+		skipped := 0
+		for _, r := range rules {
+			if !targetsWindows(r.Logsource) {
+				skipped++
+				continue
+			}
+			kept = append(kept, r)
+		}
+		rules = kept
+		if skipped > 0 {
+			fmt.Fprintf(os.Stderr, "skipped %d non-Windows rule(s) (logsource product is not windows)\n", skipped)
+		}
+	}
 	if len(rules) == 0 {
 		return fmt.Errorf("no valid Sigma rules found in %s", rulesPath)
 	}
@@ -211,17 +226,33 @@ func run(rulesPath, configPath, outPath string, timeframe time.Duration, inputs 
 		}
 	}
 
-	groups := buildBundles(detectionRules, options...)
-
+	// The rules a correlation evaluates internally get the same logsource scoping
+	// as the bundled rules, so out-of-scope events can't advance its windows.
+	corrOptions := append(append([]evaluator.Option{}, options...), evaluator.WithEventFilter(logsourceFilter))
 	var correlations []corrEntry
 	for _, r := range correlationRules {
-		ce, err := evaluator.ForCorrelation(r, rules, options...)
+		ce, err := evaluator.ForCorrelation(r, rules, corrOptions...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "skipping correlation rule %q: %v\n", r.Title, err)
 			continue
 		}
 		correlations = append(correlations, corrEntry{ce: ce, channels: correlationChannels(r, rules)})
 	}
+
+	// Per the Sigma correlation spec, the rules a correlation references only
+	// produce alerts of their own when it sets `generate: true`; by default only
+	// the correlation is reported.
+	hidden := hiddenByCorrelations(correlations)
+	detectionRules = withoutHidden(detectionRules, hidden)
+	kept := correlations[:0]
+	for _, c := range correlations {
+		if !hidden.has(c.ce.Rule) {
+			kept = append(kept, c)
+		}
+	}
+	correlations = kept
+
+	groups := buildBundles(detectionRules, options...)
 
 	fmt.Fprintf(os.Stderr, "loaded %d detection rule(s), %d correlation rule(s)\n", len(detectionRules), len(correlations))
 
@@ -274,6 +305,47 @@ func run(rulesPath, configPath, outPath string, timeframe time.Duration, inputs 
 		return fmt.Errorf("all %d input file(s) failed", failed)
 	}
 	return nil
+}
+
+// ruleRefs is a set of rule references (names and IDs).
+type ruleRefs map[string]bool
+
+func (refs ruleRefs) has(r sigma.Rule) bool {
+	return (r.Name != "" && refs[r.Name]) || (r.ID != "" && refs[r.ID])
+}
+
+// hiddenByCorrelations returns the rules that only exist to feed a correlation:
+// referenced by a correlation without `generate: true`, and not by any
+// correlation with it.
+func hiddenByCorrelations(correlations []corrEntry) ruleRefs {
+	hidden, generated := ruleRefs{}, ruleRefs{}
+	for _, c := range correlations {
+		corr := c.ce.Rule.Correlation
+		for _, ref := range corr.Rules {
+			if corr.Generate {
+				generated[ref] = true
+			} else {
+				hidden[ref] = true
+			}
+		}
+	}
+	for ref := range generated {
+		delete(hidden, ref)
+	}
+	return hidden
+}
+
+func withoutHidden(rules []sigma.Rule, hidden ruleRefs) []sigma.Rule {
+	if len(hidden) == 0 {
+		return rules
+	}
+	var kept []sigma.Rule
+	for _, r := range rules {
+		if !hidden.has(r) {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }
 
 // scanFile parses one evtx file and writes a CSV row for every (event, matching
@@ -345,6 +417,7 @@ func matchEvent(ctx context.Context, event map[string]interface{}, sourceFile, r
 		ctx = evaluator.WithEventTime(ctx, t)
 	}
 	eventChannel := field(event, "Channel")
+	eventID := field(event, "EventID")
 	// Marshal the event lazily: on a realistic scan almost no events match, and
 	// JSON-encoding every event would dominate the scan's cost.
 	eventJSON := ""
@@ -364,10 +437,10 @@ func matchEvent(ctx context.Context, event map[string]interface{}, sourceFile, r
 	}
 
 	for _, g := range groups {
-		// Channel filter (mirrors Hayabusa): a group whose rules target a different
-		// channel is skipped before evaluation, so its aggregation state never sees
-		// this event.
-		if !channelApplies(g.channels, eventChannel) {
+		// Logsource filter (mirrors Hayabusa): a group whose rules target a
+		// different channel or event ID is skipped before evaluation, so its
+		// aggregation state never sees this event.
+		if !scopeApplies(g.scopes, eventChannel, eventID) {
 			continue
 		}
 		// Matches returns the healthy rules' results even when some rules error.
@@ -455,7 +528,7 @@ func flattenSystem(sys *ordereddict.Dict, out map[string]interface{}) {
 	}
 	for _, k := range []string{"Channel", "Computer", "Level", "Task", "Opcode", "Version", "EventRecordID", "Keywords"} {
 		if v, ok := sys.Get(k); ok {
-			out[k] = v
+			out[k] = normalizeEventValue(k, v)
 		}
 	}
 	if tc, ok := getDict(sys, "TimeCreated"); ok {
@@ -482,7 +555,7 @@ func mergeLeaves(d *ordereddict.Dict, out map[string]interface{}) {
 		if sub, ok := v.(*ordereddict.Dict); ok {
 			mergeLeaves(sub, out)
 		} else {
-			out[k] = normalizeEventValue(v)
+			out[k] = normalizeEventValue(k, v)
 		}
 	}
 }

@@ -61,9 +61,14 @@ e := evaluator.ForRule(rule,
 The available option constructors are `CountImplementation`, `CountDistinctImplementation`,
 `SumImplementation`, `AverageImplementation`, `MinImplementation`, and `MaxImplementation`.
 
-This repo includes some toy implementations in the `evaluator/aggregators` package
-(`aggregators.InMemory(timeframe)` returns a ready-made set of these options) but
-for production use cases you'll need to supply your own.
+This repo includes in-memory implementations in the `evaluator/aggregators` package
+(`aggregators.InMemory(timeframe)` returns a ready-made set of these options). They
+compute exact sliding windows over the rule's `timeframe` but keep all state in one
+process; for distributed production pipelines you'll need to supply your own.
+
+To restrict which events a rule sees at all (for example to the log source its
+`logsource` targets), pass `evaluator.WithEventFilter(func(rule sigma.Rule, event evaluator.Event) bool { ... })`.
+Filtered events are reported as non-matching and never reach aggregation state.
 
 ## `sigmac` CLI: scan Windows .evtx logs
 
@@ -86,14 +91,23 @@ Flags:
 | `-config` | Optional Sigma config file (field mappings). |
 | `-out` | Output CSV path (default: stdout). |
 | `-timeframe` | Default sliding window for aggregation rules that don't specify their own (default `1h`). |
-| `-channel-filter` | Only evaluate a rule against events from the channel its logsource targets (default `true`; faster and avoids cross-channel matches). |
+| `-channel-filter` | Only evaluate a rule against events from the channel and event IDs its logsource targets, and skip rules whose logsource product isn't `windows` (default `true`; faster and avoids cross-channel/cross-category matches). |
 | `-exclude` | Comma-separated files of rule IDs to skip, in `<uuid> # comment` format. Accepts Hayabusa's `exclude_rules.txt`/`noisy_rules.txt` verbatim. |
 
 Event field values are normalised on ingest the way Event Viewer/Hayabusa present
 them — leading/trailing whitespace is trimmed (Windows pads fields like
-`LogonProcessName`) — and aggregation/correlation windows are keyed off each
-event's own timestamp, so `count()`/correlation results are correct when replaying
-historical logs.
+`LogonProcessName`), and hex-typed fields (`Status`, `SubStatus`,
+`TicketEncryptionType`, `AccessMask`, `GrantedAccess`, logon IDs, ...) are rendered
+as `0x…` so rules such as `SubStatus: '0xC000006A'` match — and
+aggregation/correlation windows are keyed off each event's own timestamp, so
+`count()`/correlation results are correct when replaying historical logs.
+
+The logsource filter scopes each rule like Hayabusa does: a `service` maps to its
+channel (`security` → `Security`, `sysmon` → `Microsoft-Windows-Sysmon/Operational`,
+...), and a `category` maps to its channel *and* event IDs (`process_creation` →
+Sysmon EID 1 or Security 4688, `network_connection` → Sysmon EID 3, `ps_script` →
+PowerShell EID 4104, ...), so a `process_creation` rule doesn't fire on the network
+connections or image loads of the same process.
 
 Each output row is one `(event, matching rule)` pair with columns:
 `timestamp, source_file, record_id, computer, channel, event_id, rule_id, rule_title, rule_level, rule_tags, event_json`.
@@ -102,8 +116,9 @@ The evtx event is flattened into the field names Sigma Windows rules expect
 (`EventID`, `Provider_Name`, `Channel`, `Computer`, plus the `EventData`/`UserData`
 fields), and the full flattened event is preserved as JSON in the last column.
 
-Detection rules (including `count()`/aggregation rules) are evaluated together as
-a single bundle; Sigma correlation rules are evaluated separately. Note that
-aggregation and correlation windows use wall-clock arrival time, so on historical
-replay (processing an old evtx all at once) those windowed results are
-approximate — single-event detection rules are unaffected.
+Detection rules (including `count()`/aggregation rules) are evaluated together in
+bundles grouped by logsource scope; Sigma correlation rules (`event_count`,
+`value_count`, `value_sum`, `value_avg`, `temporal`, `temporal_ordered`) are
+evaluated separately. As the Sigma correlation specification prescribes, a rule
+referenced by a correlation is only reported on its own when that correlation sets
+`generate: true`; otherwise only the correlation alert is written.

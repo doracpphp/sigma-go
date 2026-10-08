@@ -3,6 +3,8 @@ package evaluator
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,7 +14,8 @@ import (
 
 // CorrelationEvaluator evaluates a Sigma correlation rule: a meta-rule that
 // aggregates the matches of one or more referenced rules over a sliding time
-// window (event_count, value_count, temporal, temporal_ordered).
+// window (event_count, value_count, temporal, temporal_ordered, value_sum,
+// value_avg).
 //
 // It is stateful: feed it the same stream of events you feed your normal rule
 // evaluators and it raises a match when the correlation condition is met. State
@@ -64,16 +67,20 @@ func forCorrelation(rule sigma.Rule, referencedRules []sigma.Rule, visiting map[
 	}
 	correlation := *rule.Correlation
 	switch correlation.Type {
-	case sigma.CorrelationEventCount, sigma.CorrelationValueCount,
-		sigma.CorrelationTemporal, sigma.CorrelationTemporalOrdered:
+	case sigma.CorrelationTemporal, sigma.CorrelationTemporalOrdered:
+	case sigma.CorrelationEventCount:
+		if correlation.Condition == nil {
+			return nil, fmt.Errorf("%s correlation requires a condition", correlation.Type)
+		}
+	case sigma.CorrelationValueCount, sigma.CorrelationValueSum, sigma.CorrelationValueAvg:
+		if correlation.Condition == nil {
+			return nil, fmt.Errorf("%s correlation requires a condition", correlation.Type)
+		}
+		if correlation.Condition.Field == "" {
+			return nil, fmt.Errorf("%s correlation requires condition.field", correlation.Type)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported correlation type %q", correlation.Type)
-	}
-	if (correlation.Type == sigma.CorrelationEventCount || correlation.Type == sigma.CorrelationValueCount) && correlation.Condition == nil {
-		return nil, fmt.Errorf("%s correlation requires a condition", correlation.Type)
-	}
-	if correlation.Type == sigma.CorrelationValueCount && correlation.Condition.Field == "" {
-		return nil, fmt.Errorf("value_count correlation requires condition.field")
 	}
 	if correlation.Timespan.Duration() <= 0 {
 		// The spec makes timespan mandatory; without one the sliding window is
@@ -188,22 +195,20 @@ func (c *CorrelationEvaluator) matches(ctx context.Context, event Event, now tim
 
 	key, groupValues := c.groupKey(event, matched, childGroupValues)
 
-	value := ""
-	hasValue := false
+	obs := observation{rules: matched}
 	if c.correlation.Condition != nil && c.correlation.Condition.Field != "" {
 		// An absent field must not be counted as a distinct value (a password-spray
 		// rule would otherwise count "<nil>" as an extra user).
 		if field := c.correlation.Condition.Field; eventKeyExists(event, field) {
-			value = fmt.Sprint(eventValue(event, field))
-			hasValue = true
+			raw := eventValue(event, field)
+			obs.value = fmt.Sprint(raw)
+			obs.hasValue = true
+			// value_sum / value_avg only aggregate values that are numbers.
+			obs.num, obs.hasNum = numericValue(raw)
 		}
 	}
 
-	fired := c.state.observe(now, key, observation{
-		rules:    matched,
-		value:    value,
-		hasValue: hasValue,
-	}, c.correlation, len(c.referenced))
+	fired := c.state.observe(now, key, obs, c.correlation, len(c.referenced))
 
 	return CorrelationResult{Match: fired, GroupValues: groupValues}, nil
 }
@@ -256,6 +261,52 @@ type observation struct {
 	rules    map[int]bool
 	value    string
 	hasValue bool
+	num      float64
+	hasNum   bool
+}
+
+// numericValue interprets an event field value as a number for value_sum and
+// value_avg: numeric Go values directly, strings when they parse as a decimal
+// float or an integer literal (including 0x hex, as Windows renders many fields).
+func numericValue(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	s := strings.TrimSpace(fmt.Sprint(v))
+	// NaN/Inf parse as floats but would poison every later sum and average.
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		return f, true
+	}
+	if i, err := strconv.ParseInt(s, 0, 64); err == nil {
+		return float64(i), true
+	}
+	if u, err := strconv.ParseUint(s, 0, 64); err == nil {
+		return float64(u), true
+	}
+	return 0, false
 }
 
 type correlationState struct {
@@ -302,6 +353,8 @@ type corrEvent struct {
 	rules    map[int]bool
 	value    string
 	hasValue bool
+	num      float64
+	hasNum   bool
 }
 
 func (s *correlationState) observe(now time.Time, key string, obs observation, correlation sigma.Correlation, numRules int) bool {
@@ -320,7 +373,7 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 	// when events arrive out of order (multi-source ingestion, replay), and so the
 	// newest event is always last (the sweep relies on that). Events almost always
 	// arrive in order, so this is an append in the common case.
-	ev := corrEvent{at: now, rules: obs.rules, value: obs.value, hasValue: obs.hasValue}
+	ev := corrEvent{at: now, rules: obs.rules, value: obs.value, hasValue: obs.hasValue, num: obs.num, hasNum: obs.hasNum}
 	pos := len(g.events)
 	for pos > 0 && g.events[pos-1].at.After(now) {
 		pos--
@@ -343,7 +396,7 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 	fired := false
 	switch correlation.Type {
 	case sigma.CorrelationEventCount:
-		fired = compareCount(len(g.events), correlation.Condition)
+		fired = compareThreshold(float64(len(g.events)), correlation.Condition)
 
 	case sigma.CorrelationValueCount:
 		distinct := map[string]struct{}{}
@@ -352,7 +405,24 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 				distinct[e.value] = struct{}{}
 			}
 		}
-		fired = compareCount(len(distinct), correlation.Condition)
+		fired = compareThreshold(float64(len(distinct)), correlation.Condition)
+
+	case sigma.CorrelationValueSum, sigma.CorrelationValueAvg:
+		sum, n := 0.0, 0
+		for _, e := range g.events {
+			if e.hasNum {
+				sum += e.num
+				n++
+			}
+		}
+		if n == 0 {
+			// No numeric value in the window yet: there is nothing to compare.
+			break
+		}
+		if correlation.Type == sigma.CorrelationValueAvg {
+			sum /= float64(n)
+		}
+		fired = compareThreshold(sum, correlation.Condition)
 
 	case sigma.CorrelationTemporal:
 		seen := map[int]bool{}
@@ -387,7 +457,10 @@ func (s *correlationState) observe(now time.Time, key string, obs observation, c
 	return fired
 }
 
-func compareCount(count int, cond *sigma.CorrelationCondition) bool {
+// compareThreshold reports whether value satisfies every term of the
+// correlation condition (multiple terms are linked with logical AND per the
+// spec).
+func compareThreshold(value float64, cond *sigma.CorrelationCondition) bool {
 	if cond == nil {
 		return false
 	}
@@ -395,22 +468,22 @@ func compareCount(count int, cond *sigma.CorrelationCondition) bool {
 	if len(terms) == 0 {
 		terms = []sigma.CorrelationConditionTerm{{Op: cond.Op, Count: cond.Count}}
 	}
-	// Multiple condition terms are linked with logical AND per the spec.
 	for _, term := range terms {
+		threshold := term.Value()
 		ok := false
 		switch term.Op {
 		case "gt":
-			ok = count > term.Count
+			ok = value > threshold
 		case "gte":
-			ok = count >= term.Count
+			ok = value >= threshold
 		case "lt":
-			ok = count < term.Count
+			ok = value < threshold
 		case "lte":
-			ok = count <= term.Count
+			ok = value <= threshold
 		case "eq":
-			ok = count == term.Count
+			ok = value == threshold
 		case "neq":
-			ok = count != term.Count
+			ok = value != threshold
 		}
 		if !ok {
 			return false

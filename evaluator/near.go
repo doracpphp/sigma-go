@@ -65,7 +65,9 @@ func collectIdentifiers(expr sigma.SearchExpr, searches map[string]sigma.Search)
 			set[s.Ident.Name] = true
 		case sigma.OneOfThem, sigma.AllOfThem:
 			for name := range searches {
-				set[name] = true
+				if includedInThem(name) {
+					set[name] = true
+				}
 			}
 		case sigma.OneOfPattern:
 			for name := range searches {

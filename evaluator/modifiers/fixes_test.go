@@ -98,3 +98,33 @@ func TestCompileRegexCachesFailures(t *testing.T) {
 		}
 	}
 }
+
+// Event sources such as the evtx parser produce unsigned and sized integers
+// (EventID is a uint16, LogonType a uint32); numeric comparators used to reject
+// every kind but int and float64, so `LogonType|gte: 5` never matched.
+func TestNumericComparatorsAcceptAllNumericKinds(t *testing.T) {
+	cases := []struct {
+		actual   any
+		expected any
+		gte      bool
+	}{
+		{uint16(4688), 4688, true},
+		{uint32(5), 5, true},
+		{uint32(3), 5, false},
+		{uint64(1 << 63), 5, true}, // beyond int64: compared as float
+		{int8(-1), 0, false},
+		{float32(2.5), 2.5, true},
+		{"0x17", 23, true}, // hex string (as rendered for HexInt fields)
+		{uint32(7), "5", true},
+	}
+	for _, tc := range cases {
+		got, err := (gte{}).Matches(tc.actual, tc.expected)
+		if err != nil {
+			t.Errorf("gte(%T %v, %v): %v", tc.actual, tc.actual, tc.expected, err)
+			continue
+		}
+		if got != tc.gte {
+			t.Errorf("gte(%T %v, %v) = %v, want %v", tc.actual, tc.actual, tc.expected, got, tc.gte)
+		}
+	}
+}
