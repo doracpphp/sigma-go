@@ -246,11 +246,26 @@ correlation:
 // would false-positive on evtx events.
 func TestTargetsWindows(t *testing.T) {
 	for _, tc := range []struct {
-		product string
-		want    bool
-	}{{"", true}, {"windows", true}, {"Windows", true}, {"linux", false}, {"macos", false}} {
-		if got := targetsWindows(sigma.Logsource{Product: tc.product}); got != tc.want {
-			t.Errorf("targetsWindows(%q) = %v, want %v", tc.product, got, tc.want)
+		ls   sigma.Logsource
+		want bool
+	}{
+		{sigma.Logsource{}, true},
+		{sigma.Logsource{Product: "windows"}, true},
+		{sigma.Logsource{Product: "Windows", Category: "webserver"}, true},
+		{sigma.Logsource{Product: "linux", Category: "process_creation"}, false},
+		{sigma.Logsource{Product: "macos"}, false},
+		// Product-less rules for other log types: a `category: database` rule
+		// with the keyword "dump" matched every comsvcs MiniDump command line.
+		{sigma.Logsource{Category: "database"}, false},
+		{sigma.Logsource{Category: "webserver"}, false},
+		{sigma.Logsource{Category: "dns"}, false},
+		{sigma.Logsource{Service: "apache"}, false},
+		// ...but known Windows sources without a product are kept.
+		{sigma.Logsource{Category: "process_creation"}, true},
+		{sigma.Logsource{Service: "security"}, true},
+	} {
+		if got := targetsWindows(tc.ls); got != tc.want {
+			t.Errorf("targetsWindows(%+v) = %v, want %v", tc.ls, got, tc.want)
 		}
 	}
 }

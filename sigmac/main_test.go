@@ -130,3 +130,20 @@ func TestSplitYAMLDocsCRLF(t *testing.T) {
 		t.Fatalf("expected 2 documents, got %d (err=%v)", len(docs), err)
 	}
 }
+
+// Windows Defender names EventData fields with spaces ("New Value"); Sigma
+// rules use the space-free form, so both names must be present. A real field
+// with the space-free name wins over the alias.
+func TestFlattenEvent_SpaceFreeFieldAlias(t *testing.T) {
+	data := ordereddict.NewDict().
+		Set("New Value", `HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\x = 0x0`).
+		Set("Product Name", "Antivirus").
+		Set("ProductName", "real")
+	out := flattenEvent(buildEvent("EventData", data))
+	if out["NewValue"] != out["New Value"] || out["NewValue"] == nil {
+		t.Errorf("NewValue alias = %v, want the value of \"New Value\"", out["NewValue"])
+	}
+	if out["ProductName"] != "real" {
+		t.Errorf("ProductName = %v, want the real field to win over the alias", out["ProductName"])
+	}
+}

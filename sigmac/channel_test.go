@@ -34,6 +34,11 @@ func TestRuleAppliesToChannel(t *testing.T) {
 		{"registry_event covers 12-14", sigma.Logsource{Category: "registry_event"}, "Microsoft-Windows-Sysmon/Operational", "13", true},
 		{"ps_script on module logging event", sigma.Logsource{Category: "ps_script"}, "Microsoft-Windows-PowerShell/Operational", "4103", false},
 		{"missing event ID: not filtered", sigma.Logsource{Category: "image_load"}, "Microsoft-Windows-Sysmon/Operational", "", true},
+		// An unmapped service imposes no restriction, so a capi2 rule for EventID 70
+		// used to fire on RdpCoreTS events that share the ID.
+		{"capi2 rule on RdpCoreTS event with the same ID", sigma.Logsource{Service: "capi2"}, "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational", "70", false},
+		{"capi2 rule on CAPI2 event", sigma.Logsource{Service: "capi2"}, "Microsoft-Windows-CAPI2/Operational", "70", true},
+		{"powershell service on PowerShell 7 channel", sigma.Logsource{Service: "powershell"}, "PowerShellCore/Operational", "4104", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

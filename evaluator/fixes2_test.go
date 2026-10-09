@@ -266,3 +266,40 @@ detection:
 		t.Fatal("value_sum without condition.field should be rejected")
 	}
 }
+
+// Without the `expand` modifier and without an expander, `%name%` values are
+// literal text (Windows environment variables in command lines). They used to
+// make the whole rule fail with "no placeholder expander function defined".
+func TestPercentValuesAreLiteralWithoutExpand(t *testing.T) {
+	rule := parse(t, `
+title: env var
+detection:
+  selection:
+    CommandLine|contains: '%comspec%'
+  other:
+    Image|endswith: '\cmd.exe'
+  condition: selection or other
+`)
+	r, err := ForRule(rule).Matches(context.Background(), map[string]interface{}{
+		"CommandLine": `cmd /c %COMSPEC% /c whoami`,
+		"Image":       `C:\Windows\notepad.exe`,
+	})
+	if err != nil {
+		t.Fatalf("literal %%...%% value must not need an expander: %v", err)
+	}
+	if !r.Match {
+		t.Errorf("expected the literal %q value to match", "%comspec%")
+	}
+
+	// With `expand` the placeholder is required, so a missing expander is an error.
+	expandRule := parse(t, `
+title: expand
+detection:
+  selection:
+    User|expand: '%admins%'
+  condition: selection
+`)
+	if _, err := ForRule(expandRule).Matches(context.Background(), map[string]interface{}{"User": "x"}); err == nil {
+		t.Error("an expand placeholder without an expander should be an error")
+	}
+}

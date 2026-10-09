@@ -6,7 +6,7 @@ import (
 )
 
 // hexFields are the Windows event fields whose schema type is HexInt32/HexInt64.
-// Event Viewer, the event XML and Hayabusa all render them as 0x-prefixed hex
+// Event Viewer and the event XML render them as 0x-prefixed hex
 // (`Status: 0xc000006d`), and Sigma rules are written against that form, but the
 // evtx parser hands them over as plain integers (3221225581). The schema type
 // isn't exposed by the parser (HexInt32 and UInt32 both arrive as uint32), so
@@ -25,8 +25,8 @@ var hexFields = map[string]bool{
 	"Keywords":             true, // System/Keywords
 }
 
-// normalizeEventValue normalizes a flattened event value the way tools such as
-// Hayabusa and Event Viewer present Windows event fields, so that Sigma rules
+// normalizeEventValue normalizes a flattened event value the way Event Viewer
+// presents Windows event fields, so that Sigma rules
 // (written against the human-readable form) match:
 //   - leading/trailing whitespace is removed, since Windows pads many Security
 //     fields (e.g. LogonProcessName is "NtLmSsp " while rules look for "NtLmSsp");
@@ -36,9 +36,9 @@ var hexFields = map[string]bool{
 // Other values pass through unchanged.
 //
 // Note: %%NNNN message-table codes (e.g. "%%1833") are deliberately NOT resolved.
-// Hayabusa and raw-evtx matching both compare these verbatim, so resolving them
-// only causes divergence (rules written against raw codes stop matching, while
-// rules written against resolved text match events the reference tools don't flag).
+// Sigma rules for evtx compare these verbatim, so resolving them only causes
+// divergence (rules written against raw codes stop matching, while rules written
+// against resolved text match events other evtx tools don't flag).
 func normalizeEventValue(key string, v interface{}) interface{} {
 	switch val := v.(type) {
 	case string:
